@@ -12,170 +12,285 @@ st.set_page_config(
 
 st.title("PDF to QuickBooks Converter")
 st.write("Convert TD bank PDF statements into QuickBooks-ready files.")
-
 st.divider()
 
 
-def money_to_float(value):
-    return float(value.replace(",", ""))
+def clean_amount(value):
+    if not value:
+        return 0.0
+
+    value = value.replace(",", "").replace("$", "").strip()
+
+    try:
+        return float(value)
+    except:
+        return 0.0
 
 
-def extract_td_statement(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-    text = ""
-    for page in doc:
-        text += page.get_text() + "\n"
-
-    # Statement year
-    year_match = re.search(
-        r'APR\s+\d{1,2}/(\d{2})\s*-\s*MAY\s+\d{1,2}/(\d{2})',
+def extract_statement_year(text):
+    match = re.search(
+        r'([A-Z]{3})\s*(\d{1,2})/(\d{2})\s*-\s*'
+        r'([A-Z]{3})\s*(\d{1,2})/(\d{2})',
         text,
         re.IGNORECASE
     )
 
-    if year_match:
-        statement_year = 2000 + int(year_match.group(2))
-    else:
-        statement_year = datetime.now().year
+    if match:
+        return 2000 + int(match.group(6))
 
-    # TD statement control totals
-    credit_summary = re.search(
+    return datetime.now().year
+
+
+def get_td_control_totals(text):
+
+    credit_match = re.search(
         r'Credits\s+(\d+)\s+([\d,]+\.\d{2})',
         text,
         re.IGNORECASE
     )
 
-    debit_summary = re.search(
+    debit_match = re.search(
         r'Debits\s+(\d+)\s+([\d,]+\.\d{2})',
         text,
         re.IGNORECASE
     )
 
-    expected_credit_count = (
-        int(credit_summary.group(1)) if credit_summary else None
+    result = {
+        "credit_count": None,
+        "credit_total": None,
+        "debit_count": None,
+        "debit_total": None
+    }
+
+    if credit_match:
+        result["credit_count"] = int(credit_match.group(1))
+        result["credit_total"] = clean_amount(
+            credit_match.group(2)
+        )
+
+    if debit_match:
+        result["debit_count"] = int(debit_match.group(1))
+        result["debit_total"] = clean_amount(
+            debit_match.group(2)
+        )
+
+    return result
+
+
+def extract_td_transactions(pdf_bytes):
+
+    doc = fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf"
     )
 
-    expected_credit_total = (
-        money_to_float(credit_summary.group(2))
-        if credit_summary else None
-    )
+    all_transactions = []
+    full_text = ""
 
-    expected_debit_count = (
-        int(debit_summary.group(1)) if debit_summary else None
-    )
+    for page in doc:
 
-    expected_debit_total = (
-        money_to_float(debit_summary.group(2))
-        if debit_summary else None
+        full_text += page.get_text() + "\n"
+
+        words = page.get_text("words")
+
+        # Each word:
+        # x0, y0, x1, y1, text, block, line, word
+
+        rows = {}
+
+        for word in words:
+
+            x0, y0, x1, y1, text = word[:5]
+
+            # Group words appearing on approximately
+            # the same horizontal line.
+            row_key = round(y0 / 3) * 3
+
+            if row_key not in rows:
+                rows[row_key] = []
+
+            rows[row_key].append(
+                {
+                    "x": x0,
+                    "text": text
+                }
+            )
+
+        for y in sorted(rows.keys()):
+
+            row_words = sorted(
+                rows[y],
+                key=lambda item: item["x"]
+            )
+
+            row_text = " ".join(
+                item["text"]
+                for item in row_words
+            )
+
+            # Find TD transaction date.
+            date_match = re.search(
+                r'\b'
+                r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)'
+                r'(\d{2})'
+                r'\b',
+                row_text,
+                re.IGNORECASE
+            )
+
+            if not date_match:
+                continue
+
+            # Ignore balance-forward row.
+            if "BALANCE FORWARD" in row_text.upper():
+                continue
+
+            month = date_match.group(1).upper()
+            day = int(date_match.group(2))
+
+            description_parts = []
+            debit_parts = []
+            credit_parts = []
+
+            # TD statement columns are determined
+            # from the physical x-position.
+            for item in row_words:
+
+                x = item["x"]
+                text = item["text"]
+
+                if re.fullmatch(
+                    r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}',
+                    text,
+                    re.IGNORECASE
+                ):
+                    continue
+
+                # Description column
+                if x < 245:
+                    description_parts.append(text)
+
+                # Debit column
+                elif 245 <= x < 385:
+                    if re.fullmatch(
+                        r'[\d,]+\.\d{2}',
+                        text
+                    ):
+                        debit_parts.append(text)
+
+                # Credit column
+                elif 385 <= x < 510:
+                    if re.fullmatch(
+                        r'[\d,]+\.\d{2}',
+                        text
+                    ):
+                        credit_parts.append(text)
+
+                # x >= 510 is date/balance area
+                # and is intentionally ignored.
+
+            description = " ".join(
+                description_parts
+            ).strip()
+
+            debit = (
+                clean_amount(debit_parts[0])
+                if debit_parts
+                else 0.0
+            )
+
+            credit = (
+                clean_amount(credit_parts[0])
+                if credit_parts
+                else 0.0
+            )
+
+            if not description:
+                continue
+
+            # Ignore headings and summary rows.
+            skip_words = [
+                "DESCRIPTION",
+                "CREDITS",
+                "DEBITS",
+                "NEXT STATEMENT",
+                "MONTHLY AVER",
+                "MONTHLY MIN",
+                "DEP CONTENT"
+            ]
+
+            if any(
+                phrase in description.upper()
+                for phrase in skip_words
+            ):
+                continue
+
+            # A real transaction needs an amount.
+            if debit == 0 and credit == 0:
+                continue
+
+            all_transactions.append(
+                {
+                    "Month": month,
+                    "Day": day,
+                    "Description": description,
+                    "Debit": debit,
+                    "Credit": credit
+                }
+            )
+
+    statement_year = extract_statement_year(
+        full_text
     )
 
     transactions = []
 
-    # Rules for this TD Business Chequing format.
-    # True = debit. False = credit.
-    debit_prefixes = (
-        "TFR-TO",
-        "TD BUS CREDIT INS",
-        "TD VISA",
-        "MONTHLY PLAN FEE",
-        "BUS LINE FEE",
-        "OVERDRAFT INTEREST"
+    for item in all_transactions:
+
+        date_text = (
+            f"{item['Month']} "
+            f"{item['Day']:02d} "
+            f"{statement_year}"
+        )
+
+        try:
+
+            transaction_date = datetime.strptime(
+                date_text,
+                "%b %d %Y"
+            ).strftime("%Y-%m-%d")
+
+        except:
+
+            transaction_date = date_text
+
+        transactions.append(
+            {
+                "Date": transaction_date,
+                "Description": item["Description"],
+                "Debit": item["Debit"],
+                "Credit": item["Credit"]
+            }
+        )
+
+    controls = get_td_control_totals(
+        full_text
     )
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-
-    transaction_pattern = re.compile(
-        r'^(.*?)\s+([\d,]+\.\d{2})\s+'
-        r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)'
-        r'(\d{2})(?:\s+[\d,]+\.\d{2}OD?)?$',
-        re.IGNORECASE
+    return (
+        pd.DataFrame(transactions),
+        controls
     )
 
-    for line in lines:
 
-        if line.upper().startswith("BALANCE FORWARD"):
-            continue
-
-        match = transaction_pattern.match(line)
-
-        if not match:
-            continue
-
-        description = match.group(1).strip()
-        amount = money_to_float(match.group(2))
-        month = match.group(3).upper()
-        day = int(match.group(4))
-
-        # Exclude statement summary lines
-        if description.upper() in ("CREDITS", "DEBITS"):
-            continue
-
-        date_string = f"{month} {day:02d} {statement_year}"
-        transaction_date = datetime.strptime(
-            date_string,
-            "%b %d %Y"
-        ).strftime("%Y-%m-%d")
-
-        description_upper = description.upper()
-
-        # TD E-TRANSFER entries in this statement:
-        # SEND E-TFR = credit
-        # ordinary E-TRANSFER = debit
-        if description_upper.startswith("SEND E-TFR"):
-            is_debit = False
-
-        elif description_upper.startswith("E-TRANSFER"):
-            is_debit = True
-
-        elif any(
-            prefix in description_upper
-            for prefix in debit_prefixes
-        ):
-            is_debit = True
-
-        else:
-            # TFR-TO entries in this TD format are debit
-            if "TFR-TO" in description_upper:
-                is_debit = True
-            else:
-                # Unknown transactions remain unclassified
-                is_debit = None
-
-        if is_debit is True:
-            debit = amount
-            credit = 0.00
-
-        elif is_debit is False:
-            debit = 0.00
-            credit = amount
-
-        else:
-            debit = 0.00
-            credit = 0.00
-
-        transactions.append({
-            "Date": transaction_date,
-            "Description": description,
-            "Debit": debit,
-            "Credit": credit,
-            "Original Amount": amount
-        })
-
-    df = pd.DataFrame(transactions)
-
-    return {
-        "transactions": df,
-        "expected_debit_count": expected_debit_count,
-        "expected_debit_total": expected_debit_total,
-        "expected_credit_count": expected_credit_count,
-        "expected_credit_total": expected_credit_total
-    }
-
+# --------------------------------------------------
+# USER INTERFACE
+# --------------------------------------------------
 
 col1, col2 = st.columns(2)
 
 with col1:
+
     bank = st.selectbox(
         "Bank",
         [
@@ -185,6 +300,7 @@ with col1:
     )
 
 with col2:
+
     account_type = st.selectbox(
         "Account Type",
         [
@@ -201,20 +317,29 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
 
-    st.success(f"Uploaded: {uploaded_file.name}")
+    st.success(
+        f"Uploaded: {uploaded_file.name}"
+    )
 
     if bank != "TD Canada Trust":
-        st.warning("Please select TD Canada Trust.")
 
-    elif st.button("Process Statement", type="primary"):
+        st.warning(
+            "Please select TD Canada Trust."
+        )
+
+    elif st.button(
+        "Process Statement",
+        type="primary"
+    ):
 
         try:
 
-            result = extract_td_statement(
+            df, controls = extract_td_transactions(
                 uploaded_file.getvalue()
             )
 
-            st.session_state["td_result"] = result
+            st.session_state["transactions"] = df
+            st.session_state["controls"] = controls
 
         except Exception as e:
 
@@ -225,10 +350,14 @@ if uploaded_file is not None:
             st.exception(e)
 
 
-if "td_result" in st.session_state:
+# --------------------------------------------------
+# TRANSACTION REVIEW
+# --------------------------------------------------
 
-    result = st.session_state["td_result"]
-    df = result["transactions"]
+if "transactions" in st.session_state:
+
+    df = st.session_state["transactions"]
+    controls = st.session_state["controls"]
 
     st.divider()
     st.subheader("Transaction Review")
@@ -236,30 +365,20 @@ if "td_result" in st.session_state:
     if df.empty:
 
         st.error(
-            "No transactions were detected. "
-            "The TD statement format may be different."
+            "No transactions were detected."
         )
 
     else:
 
         edited_df = st.data_editor(
-            df[[
-                "Date",
-                "Description",
-                "Debit",
-                "Credit"
-            ]],
+            df,
             num_rows="dynamic",
-            use_container_width=True
+            use_container_width=True,
+            hide_index=True
         )
 
-        debit_total = round(
-            edited_df["Debit"].sum(), 2
-        )
-
-        credit_total = round(
-            edited_df["Credit"].sum(), 2
-        )
+        st.divider()
+        st.subheader("Statement Control")
 
         debit_count = int(
             (edited_df["Debit"] > 0).sum()
@@ -269,12 +388,20 @@ if "td_result" in st.session_state:
             (edited_df["Credit"] > 0).sum()
         )
 
-        st.subheader("Statement Control")
+        debit_total = round(
+            edited_df["Debit"].sum(),
+            2
+        )
+
+        credit_total = round(
+            edited_df["Credit"].sum(),
+            2
+        )
 
         col1, col2, col3 = st.columns(3)
 
         col1.metric(
-            "Transactions Extracted",
+            "Transactions",
             len(edited_df)
         )
 
@@ -288,51 +415,67 @@ if "td_result" in st.session_state:
             f"${credit_total:,.2f}"
         )
 
-        expected_debit_count = result[
-            "expected_debit_count"
+        st.write(
+            f"Extracted Debits: "
+            f"{debit_count} transactions"
+        )
+
+        st.write(
+            f"Extracted Credits: "
+            f"{credit_count} transactions"
+        )
+
+        expected_debits = controls[
+            "debit_count"
         ]
 
-        expected_debit_total = result[
-            "expected_debit_total"
+        expected_debit_total = controls[
+            "debit_total"
         ]
 
-        expected_credit_count = result[
-            "expected_credit_count"
+        expected_credits = controls[
+            "credit_count"
         ]
 
-        expected_credit_total = result[
-            "expected_credit_total"
+        expected_credit_total = controls[
+            "credit_total"
         ]
 
         if (
-            expected_debit_count is not None
-            and expected_credit_count is not None
+            expected_debits is not None
+            and expected_credits is not None
         ):
 
-            debit_match = (
-                debit_count == expected_debit_count
-                and abs(
-                    debit_total - expected_debit_total
-                ) < 0.01
-            )
-
-            credit_match = (
-                credit_count == expected_credit_count
-                and abs(
-                    credit_total - expected_credit_total
-                ) < 0.01
-            )
+            st.divider()
 
             st.write(
                 f"TD Statement Debits: "
-                f"{expected_debit_count} transactions, "
+                f"{expected_debits} transactions, "
                 f"${expected_debit_total:,.2f}"
             )
 
             st.write(
                 f"TD Statement Credits: "
-                f"{expected_credit_count} transactions, "
+                f"{expected_credits} transactions, "
                 f"${expected_credit_total:,.2f}"
+            )
+
+            debit_match = (
+                debit_count == expected_debits
+                and
+                abs(
+                    debit_total
+                    - expected_debit_total
+                ) < 0.01
+            )
+
+            credit_match = (
+                credit_count == expected_credits
+                and
+                abs(
+                    credit_total
+                    - expected_credit_total
+                ) < 0.01
             )
 
             if debit_match and credit_match:
@@ -347,24 +490,36 @@ if "td_result" in st.session_state:
                     "⚠ STATEMENT DOES NOT RECONCILE"
                 )
 
-                st.write(
-                    "Review the extracted transactions "
-                    "before importing into QuickBooks."
-                )
+                if not debit_match:
+
+                    st.write(
+                        "Debit difference: "
+                        f"${debit_total - expected_debit_total:,.2f}"
+                    )
+
+                if not credit_match:
+
+                    st.write(
+                        "Credit difference: "
+                        f"${credit_total - expected_credit_total:,.2f}"
+                    )
 
         st.divider()
 
-        csv = edited_df.to_csv(
+        csv_data = edited_df.to_csv(
             index=False
         ).encode("utf-8")
 
         st.download_button(
             "Download QuickBooks CSV",
-            csv,
+            csv_data,
             "td_quickbooks_transactions.csv",
             "text/csv"
         )
 
 
 st.divider()
-st.caption("Tax Square Professional Corporation")
+
+st.caption(
+    "Tax Square Professional Corporation"
+)
