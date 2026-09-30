@@ -15,6 +15,10 @@ st.write("Convert TD bank PDF statements into QuickBooks-ready files.")
 st.divider()
 
 
+# --------------------------------------------------
+# HELPER FUNCTIONS
+# --------------------------------------------------
+
 def clean_amount(value):
     if not value:
         return 0.0
@@ -23,11 +27,12 @@ def clean_amount(value):
 
     try:
         return float(value)
-    except:
+    except ValueError:
         return 0.0
 
 
 def extract_statement_year(text):
+
     match = re.search(
         r'([A-Z]{3})\s*(\d{1,2})/(\d{2})\s*-\s*'
         r'([A-Z]{3})\s*(\d{1,2})/(\d{2})',
@@ -63,19 +68,29 @@ def get_td_control_totals(text):
     }
 
     if credit_match:
-        result["credit_count"] = int(credit_match.group(1))
+        result["credit_count"] = int(
+            credit_match.group(1)
+        )
+
         result["credit_total"] = clean_amount(
             credit_match.group(2)
         )
 
     if debit_match:
-        result["debit_count"] = int(debit_match.group(1))
+        result["debit_count"] = int(
+            debit_match.group(1)
+        )
+
         result["debit_total"] = clean_amount(
             debit_match.group(2)
         )
 
     return result
 
+
+# --------------------------------------------------
+# TD PDF EXTRACTION
+# --------------------------------------------------
 
 def extract_td_transactions(pdf_bytes):
 
@@ -93,16 +108,13 @@ def extract_td_transactions(pdf_bytes):
 
         words = page.get_text("words")
 
-        # Each word:
-        # x0, y0, x1, y1, text, block, line, word
-
         rows = {}
 
         for word in words:
 
             x0, y0, x1, y1, text = word[:5]
 
-            # Group words appearing on approximately
+            # Group words located on approximately
             # the same horizontal line.
             row_key = round(y0 / 3) * 3
 
@@ -116,6 +128,10 @@ def extract_td_transactions(pdf_bytes):
                 }
             )
 
+        # ------------------------------------------
+        # READ EACH TRANSACTION ROW
+        # ------------------------------------------
+
         for y in sorted(rows.keys()):
 
             row_words = sorted(
@@ -128,7 +144,7 @@ def extract_td_transactions(pdf_bytes):
                 for item in row_words
             )
 
-            # Find TD transaction date.
+            # Find transaction date.
             date_match = re.search(
                 r'\b'
                 r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)'
@@ -141,7 +157,6 @@ def extract_td_transactions(pdf_bytes):
             if not date_match:
                 continue
 
-            # Ignore balance-forward row.
             if "BALANCE FORWARD" in row_text.upper():
                 continue
 
@@ -152,13 +167,16 @@ def extract_td_transactions(pdf_bytes):
             debit_parts = []
             credit_parts = []
 
-            # TD statement columns are determined
-            # from the physical x-position.
+            # --------------------------------------
+            # TD COLUMN POSITIONS
+            # --------------------------------------
+
             for item in row_words:
 
                 x = item["x"]
                 text = item["text"]
 
+                # Ignore date itself.
                 if re.fullmatch(
                     r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}',
                     text,
@@ -166,28 +184,31 @@ def extract_td_transactions(pdf_bytes):
                 ):
                     continue
 
-                # Description column
-                if x < 245:
+                # DESCRIPTION
+                if x < 300:
+
                     description_parts.append(text)
 
-                # Debit column
-                elif 245 <= x < 385:
+                # CHEQUE / DEBIT
+                elif 300 <= x < 430:
+
                     if re.fullmatch(
                         r'[\d,]+\.\d{2}',
                         text
                     ):
                         debit_parts.append(text)
 
-                # Credit column
-                elif 385 <= x < 510:
+                # DEPOSIT / CREDIT
+                elif 430 <= x < 555:
+
                     if re.fullmatch(
                         r'[\d,]+\.\d{2}',
                         text
                     ):
                         credit_parts.append(text)
 
-                # x >= 510 is date/balance area
-                # and is intentionally ignored.
+                # Anything farther right is normally
+                # the date/balance area.
 
             description = " ".join(
                 description_parts
@@ -208,7 +229,10 @@ def extract_td_transactions(pdf_bytes):
             if not description:
                 continue
 
-            # Ignore headings and summary rows.
+            # --------------------------------------
+            # EXCLUDE NON-TRANSACTION ROWS
+            # --------------------------------------
+
             skip_words = [
                 "DESCRIPTION",
                 "CREDITS",
@@ -225,7 +249,7 @@ def extract_td_transactions(pdf_bytes):
             ):
                 continue
 
-            # A real transaction needs an amount.
+            # Must contain a debit or credit.
             if debit == 0 and credit == 0:
                 continue
 
@@ -238,6 +262,10 @@ def extract_td_transactions(pdf_bytes):
                     "Credit": credit
                 }
             )
+
+    # ----------------------------------------------
+    # CREATE TRANSACTION DATES
+    # ----------------------------------------------
 
     statement_year = extract_statement_year(
         full_text
@@ -260,7 +288,7 @@ def extract_td_transactions(pdf_bytes):
                 "%b %d %Y"
             ).strftime("%Y-%m-%d")
 
-        except:
+        except ValueError:
 
             transaction_date = date_text
 
@@ -360,7 +388,10 @@ if "transactions" in st.session_state:
     controls = st.session_state["controls"]
 
     st.divider()
-    st.subheader("Transaction Review")
+
+    st.subheader(
+        "Transaction Review"
+    )
 
     if df.empty:
 
@@ -377,8 +408,15 @@ if "transactions" in st.session_state:
             hide_index=True
         )
 
+        # ------------------------------------------
+        # CONTROL TOTALS
+        # ------------------------------------------
+
         st.divider()
-        st.subheader("Statement Control")
+
+        st.subheader(
+            "Statement Control"
+        )
 
         debit_count = int(
             (edited_df["Debit"] > 0).sum()
@@ -424,6 +462,10 @@ if "transactions" in st.session_state:
             f"Extracted Credits: "
             f"{credit_count} transactions"
         )
+
+        # ------------------------------------------
+        # TD STATEMENT CONTROL TOTALS
+        # ------------------------------------------
 
         expected_debits = controls[
             "debit_count"
@@ -478,6 +520,10 @@ if "transactions" in st.session_state:
                 ) < 0.01
             )
 
+            # --------------------------------------
+            # RECONCILIATION RESULT
+            # --------------------------------------
+
             if debit_match and credit_match:
 
                 st.success(
@@ -503,6 +549,10 @@ if "transactions" in st.session_state:
                         "Credit difference: "
                         f"${credit_total - expected_credit_total:,.2f}"
                     )
+
+        # ------------------------------------------
+        # CSV DOWNLOAD
+        # ------------------------------------------
 
         st.divider()
 
