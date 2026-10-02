@@ -17,6 +17,7 @@ st.set_page_config(
 )
 
 st.title("PDF to QuickBooks Converter")
+
 st.write(
     "Convert bank PDF statements into QuickBooks Online CSV "
     "or QuickBooks Desktop QBO files."
@@ -26,7 +27,7 @@ st.divider()
 
 
 # =========================================================
-# HELPER FUNCTIONS
+# GENERAL HELPER FUNCTIONS
 # =========================================================
 
 def money_to_float(value):
@@ -143,7 +144,7 @@ def extract_td_transactions(pdf_bytes):
     full_text = ""
 
     # -----------------------------------------------------
-    # Collect text
+    # Collect all PDF text
     # -----------------------------------------------------
 
     for page in doc:
@@ -161,7 +162,7 @@ def extract_td_transactions(pdf_bytes):
     )
 
     # -----------------------------------------------------
-    # Process pages
+    # Process each page
     # -----------------------------------------------------
 
     for page in doc:
@@ -173,7 +174,9 @@ def extract_td_transactions(pdf_bytes):
 
         page_width = page.rect.width
 
-        # TD column locations
+        # -------------------------------------------------
+        # TD statement columns
+        # -------------------------------------------------
 
         debit_left = page_width * 0.31
         debit_right = page_width * 0.47
@@ -184,7 +187,7 @@ def extract_td_transactions(pdf_bytes):
         description_right = debit_left
 
         # -------------------------------------------------
-        # Find transaction dates
+        # Find transaction date words
         # -------------------------------------------------
 
         date_words = []
@@ -203,7 +206,7 @@ def extract_td_transactions(pdf_bytes):
                 date_words.append(word)
 
         # -------------------------------------------------
-        # Process each transaction row
+        # Process transaction rows
         # -------------------------------------------------
 
         for date_word in date_words:
@@ -309,7 +312,7 @@ def extract_td_transactions(pdf_bytes):
                 continue
 
             # -------------------------------------------------
-            # Debit / Credit
+            # Debit and credit
             # -------------------------------------------------
 
             debit = 0.0
@@ -402,15 +405,15 @@ def extract_td_transactions(pdf_bytes):
 
 
 # =========================================================
-# QUICKBOOKS ONLINE CSV GENERATOR
+# QUICKBOOKS ONLINE CSV
 # =========================================================
 
 def generate_qbo_online_csv(df):
 
     export_df = df.copy()
 
-    # Money into bank = positive
-    # Money out of bank = negative
+    # Credit = money into bank = positive
+    # Debit = money out of bank = negative
 
     export_df["Amount"] = (
         export_df["Credit"]
@@ -426,8 +429,6 @@ def generate_qbo_online_csv(df):
         ]
     ].copy()
 
-    # Use MM/DD/YYYY for QuickBooks
-
     export_df["Date"] = pd.to_datetime(
         export_df["Date"]
     ).dt.strftime("%m/%d/%Y")
@@ -438,27 +439,8 @@ def generate_qbo_online_csv(df):
 
 
 # =========================================================
-# QUICKBOOKS DESKTOP QBO GENERATOR
+# QUICKBOOKS DESKTOP HELPERS
 # =========================================================
-
-def create_fitid(
-    date,
-    description,
-    amount,
-    sequence
-):
-
-    source = (
-        f"{date}|"
-        f"{description}|"
-        f"{amount:.2f}|"
-        f"{sequence}"
-    )
-
-    return hashlib.sha256(
-        source.encode("utf-8")
-    ).hexdigest()[:24]
-
 
 def clean_qbo_text(text):
 
@@ -479,14 +461,68 @@ def clean_qbo_text(text):
         ""
     )
 
-    return text[:200]
+    return text.strip()[:255]
 
+
+def create_fitid(
+    date_text,
+    description,
+    amount,
+    occurrence
+):
+
+    """
+    Creates a stable unique transaction ID.
+
+    If the same PDF is converted again, the same transaction
+    should receive the same FITID.
+    """
+
+    source = (
+        f"TD|"
+        f"{date_text}|"
+        f"{description}|"
+        f"{amount:.2f}|"
+        f"{occurrence}"
+    )
+
+    digest = hashlib.sha256(
+        source.encode("utf-8")
+    ).hexdigest()
+
+    # Numeric-looking ID is closer to TD's own QBO format
+
+    numeric_fitid = str(
+        int(
+            digest[:15],
+            16
+        )
+    )
+
+    return numeric_fitid[:20]
+
+
+def td_qbo_datetime(date_object):
+
+    """
+    Match TD Web Connect style:
+    YYYYMMDD020000[-5:EST]
+    """
+
+    return (
+        date_object.strftime("%Y%m%d")
+        +
+        "020000[-5:EST]"
+    )
+
+
+# =========================================================
+# QUICKBOOKS DESKTOP QBO GENERATOR
+# =========================================================
 
 def generate_desktop_qbo(
     df,
-    bank_id="004",
-    account_id="5263645",
-    currency="CAD"
+    account_id="5263645"
 ):
 
     if df.empty:
@@ -498,25 +534,47 @@ def generate_desktop_qbo(
         working_df["Date"]
     )
 
-    start_date = (
+    # -----------------------------------------------------
+    # Statement dates
+    # -----------------------------------------------------
+
+    first_date = (
         working_df["DateObject"]
         .min()
-        .strftime("%Y%m%d")
     )
 
-    end_date = (
+    last_date = (
         working_df["DateObject"]
         .max()
-        .strftime("%Y%m%d")
     )
 
-    now_text = datetime.now().strftime(
-        "%Y%m%d%H%M%S"
+    start_date = (
+        first_date.strftime(
+            "%Y%m%d"
+        )
+    )
+
+    end_date = td_qbo_datetime(
+        last_date
+    )
+
+    server_time = (
+        datetime.now()
+        .strftime("%Y%m%d%H%M%S")
+        +
+        "[-5:EST]"
     )
 
     transaction_blocks = []
 
-    for sequence, row in working_df.iterrows():
+    # Used to distinguish identical transactions
+    duplicate_counter = {}
+
+    # -----------------------------------------------------
+    # Transactions
+    # -----------------------------------------------------
+
+    for _, row in working_df.iterrows():
 
         debit = float(
             row["Debit"]
@@ -530,9 +588,17 @@ def generate_desktop_qbo(
             credit - debit
         )
 
-        transaction_date = (
+        transaction_date_object = (
             row["DateObject"]
+        )
+
+        transaction_date = (
+            transaction_date_object
             .strftime("%Y%m%d")
+        )
+
+        posted_date = td_qbo_datetime(
+            transaction_date_object
         )
 
         description = clean_qbo_text(
@@ -540,26 +606,58 @@ def generate_desktop_qbo(
         )
 
         if amount < 0:
-            transaction_type = "DEBIT"
+
+            transaction_type = (
+                "DEBIT"
+            )
+
         else:
-            transaction_type = "CREDIT"
+
+            transaction_type = (
+                "CREDIT"
+            )
+
+        # ---------------------------------------------
+        # Stable duplicate handling
+        # ---------------------------------------------
+
+        duplicate_key = (
+            transaction_date,
+            description,
+            f"{amount:.2f}"
+        )
+
+        duplicate_counter[
+            duplicate_key
+        ] = (
+            duplicate_counter.get(
+                duplicate_key,
+                0
+            )
+            +
+            1
+        )
+
+        occurrence = duplicate_counter[
+            duplicate_key
+        ]
 
         fitid = create_fitid(
             transaction_date,
             description,
             amount,
-            sequence
+            occurrence
         )
 
-        block = f"""
-<STMTTRN>
-<TRNTYPE>{transaction_type}
-<DTPOSTED>{transaction_date}120000
-<TRNAMT>{amount:.2f}
-<FITID>{fitid}
-<NAME>{description}
-<MEMO>{description}
-</STMTTRN>"""
+        block = (
+            "<STMTTRN>\n"
+            f"<TRNTYPE>{transaction_type}\n"
+            f"<DTPOSTED>{posted_date}\n"
+            f"<TRNAMT>{amount:.2f}\n"
+            f"<FITID>{fitid}\n"
+            f"<NAME>{description}\n"
+            "</STMTTRN>"
+        )
 
         transaction_blocks.append(
             block
@@ -569,10 +667,40 @@ def generate_desktop_qbo(
         transaction_blocks
     )
 
+    # -----------------------------------------------------
+    # Transaction request UID
+    # -----------------------------------------------------
+
+    trnuid_source = (
+        f"{account_id}|"
+        f"{start_date}|"
+        f"{end_date}"
+    )
+
+    trnuid_hash = hashlib.sha256(
+        trnuid_source.encode("utf-8")
+    ).hexdigest()[:12]
+
+    trnuid = (
+        f"TAXSQUARE-{trnuid_hash}"
+    )
+
+    # -----------------------------------------------------
+    # TD-specific Web Connect structure
+    #
+    # Based on actual TD-generated QBO file:
+    #
+    # SECURITY:TYPE1
+    # INTU.BID: 00002
+    # BANKID: 300000100
+    # CAD
+    # CHECKING
+    # -----------------------------------------------------
+
     qbo_text = f"""OFXHEADER:100
 DATA:OFXSGML
 VERSION:102
-SECURITY:NONE
+SECURITY:TYPE1
 ENCODING:USASCII
 CHARSET:1252
 COMPRESSION:NONE
@@ -585,53 +713,37 @@ NEWFILEUID:NONE
 <STATUS>
 <CODE>0
 <SEVERITY>INFO
+<MESSAGE>OK
 </STATUS>
-<DTSERVER>{now_text}
+<DTSERVER>{server_time}
+<USERKEY>--NoUserKey--
 <LANGUAGE>ENG
-<FI>
-<ORG>TD
-<FID>004
-</FI>
+<INTU.BID>00002
 </SONRS>
 </SIGNONMSGSRSV1>
-
 <BANKMSGSRSV1>
 <STMTTRNRS>
-<TRNUID>0
+<TRNUID>{trnuid}
 <STATUS>
 <CODE>0
 <SEVERITY>INFO
+<MESSAGE>OK
 </STATUS>
-
 <STMTRS>
-
-<CURDEF>{currency}
-
+<CURDEF>CAD
 <BANKACCTFROM>
-<BANKID>{bank_id}
+<BANKID>300000100
 <ACCTID>{account_id}
 <ACCTTYPE>CHECKING
 </BANKACCTFROM>
-
 <BANKTRANLIST>
-
-<DTSTART>{start_date}120000
-<DTEND>{end_date}120000
-
+<DTSTART>{start_date}
+<DTEND>{end_date}
 {transactions_text}
-
 </BANKTRANLIST>
-
-<LEDGERBAL>
-<BALAMT>0.00
-<DTASOF>{end_date}120000
-</LEDGERBAL>
-
 </STMTRS>
-
 </STMTTRNRS>
 </BANKMSGSRSV1>
-
 </OFX>
 """
 
@@ -850,7 +962,7 @@ if "transactions" in st.session_state:
         reconciled = False
 
         # -------------------------------------------------
-        # Compare to TD control totals
+        # Compare with statement totals
         # -------------------------------------------------
 
         if (
@@ -865,15 +977,13 @@ if "transactions" in st.session_state:
 
             st.write(
                 f"TD Statement Debits: "
-                f"{control['debit_count']} "
-                f"transactions, "
+                f"{control['debit_count']} transactions, "
                 f"${control['debit_total']:,.2f}"
             )
 
             st.write(
                 f"TD Statement Credits: "
-                f"{control['credit_count']} "
-                f"transactions, "
+                f"{control['credit_count']} transactions, "
                 f"${control['credit_total']:,.2f}"
             )
 
@@ -945,6 +1055,21 @@ if "transactions" in st.session_state:
                     f"${credit_difference:,.2f}"
                 )
 
+                if not debit_count_match:
+
+                    st.write(
+                        "Debit transaction count difference: "
+                        f"{debit_count - control['debit_count']}"
+                    )
+
+                if not credit_count_match:
+
+                    st.write(
+                        "Credit transaction count difference: "
+                        f"{credit_count - control['credit_count']}"
+                    )
+
+
         # =================================================
         # DOWNLOAD SECTION
         # =================================================
@@ -959,11 +1084,11 @@ if "transactions" in st.session_state:
 
             st.success(
                 "Statement verified. "
-                "Choose your QuickBooks format below."
+                "Choose your QuickBooks format."
             )
 
             # ---------------------------------------------
-            # Generate QBO Online CSV
+            # QBO Online CSV
             # ---------------------------------------------
 
             csv_data = (
@@ -973,12 +1098,13 @@ if "transactions" in st.session_state:
             )
 
             # ---------------------------------------------
-            # Generate Desktop QBO
+            # QuickBooks Desktop QBO
             # ---------------------------------------------
 
             qbo_data = (
                 generate_desktop_qbo(
-                    edited_df
+                    edited_df,
+                    account_id="5263645"
                 )
             )
 
@@ -992,8 +1118,7 @@ if "transactions" in st.session_state:
 
                 st.download_button(
                     label=(
-                        "Download QuickBooks "
-                        "Online CSV"
+                        "Download QuickBooks Online CSV"
                     ),
                     data=csv_data,
                     file_name=(
@@ -1011,8 +1136,7 @@ if "transactions" in st.session_state:
 
                 st.download_button(
                     label=(
-                        "Download QuickBooks "
-                        "Desktop QBO"
+                        "Download QuickBooks Desktop QBO"
                     ),
                     data=qbo_data,
                     file_name=(
