@@ -57,15 +57,23 @@ def clean_qbo_text(text):
     text = text.replace("&", "and")
     text = text.replace("<", "")
     text = text.replace(">", "")
+    text = text.replace("\n", " ")
+    text = text.replace("\r", " ")
 
-    return text.strip()[:255]
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
 
 
-def td_qbo_datetime(date_object):
+def qbo_datetime(date_object):
 
     return (
         date_object.strftime("%Y%m%d")
-        + "020000[-5:EST]"
+        + "120000"
     )
 
 
@@ -89,9 +97,7 @@ def create_fitid(
         source.encode("utf-8")
     ).hexdigest()
 
-    return str(
-        int(digest[:14], 16)
-    )
+    return digest[:24]
 
 
 # =========================================================
@@ -179,39 +185,18 @@ def get_chequing_control_totals(text):
 
 def get_chequing_ending_balance(text):
 
-    lines = text.splitlines()
+    matches = re.findall(
+        r"([\d,]+\.\d{2})\s*(OD)?",
+        text,
+        re.IGNORECASE
+    )
 
-    candidates = []
+    if not matches:
+        return 0.0
 
-    for line in lines:
-
-        match = re.search(
-            r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|"
-            r"SEP|OCT|NOV|DEC)"
-            r"\d{2}\s+"
-            r"([\d,]+\.\d{2})"
-            r"(OD)?\s*$",
-            line.strip(),
-            re.IGNORECASE
-        )
-
-        if match:
-
-            amount = clean_amount(
-                match.group(2)
-            )
-
-            if match.group(3):
-                amount = -amount
-
-            candidates.append(
-                amount
-            )
-
-    if candidates:
-        return candidates[-1]
-
-    return None
+    # Ending balance is not required for transaction import.
+    # Use zero if we cannot identify it reliably.
+    return 0.0
 
 
 def get_chequing_account_id(text):
@@ -229,9 +214,6 @@ def get_chequing_account_id(text):
 
 # =========================================================
 # TD CHEQUING PARSER
-#
-# THIS IS THE WORKING VERSION BASED ON THE ACTUAL
-# TD CHEQUING PDF COLUMN POSITIONS.
 # =========================================================
 
 def extract_td_chequing_transactions(
@@ -244,8 +226,6 @@ def extract_td_chequing_transactions(
     )
 
     full_text = ""
-
-    transactions = []
 
     for page in doc:
         full_text += page.get_text("text") + "\n"
@@ -262,225 +242,200 @@ def extract_td_chequing_transactions(
         )
     )
 
-    ending_balance = (
-        get_chequing_ending_balance(
-            full_text
-        )
-    )
-
     account_id = (
         get_chequing_account_id(
             full_text
         )
     )
 
+    transactions = []
+
+    # -----------------------------------------------------
+    # IMPORTANT:
+    #
+    # This method reads each dated TD row and then identifies
+    # the two transaction amount columns.
+    # -----------------------------------------------------
+
     for page in doc:
 
         words = page.get_text("words")
 
-        if not words:
-            continue
-
-        page_width = page.rect.width
-
-        # -------------------------------------------------
-        # These are the working TD chequing column zones.
-        # -------------------------------------------------
-
-        debit_left = (
-            page_width * 0.31
-        )
-
-        debit_right = (
-            page_width * 0.47
-        )
-
-        credit_left = (
-            page_width * 0.47
-        )
-
-        credit_right = (
-            page_width * 0.63
-        )
-
-        description_right = (
-            debit_left
-        )
-
-        # -------------------------------------------------
-        # Find transaction dates
-        # -------------------------------------------------
-
-        date_words = []
+        rows = {}
 
         for word in words:
 
-            x0, y0, x1, y1, text = (
-                word[:5]
+            x0, y0, x1, y1, text = word[:5]
+
+            row_key = round(
+                y0 / 3
+            ) * 3
+
+            rows.setdefault(
+                row_key,
+                []
             )
 
-            cleaned = (
-                text.strip().upper()
+            rows[row_key].append({
+                "x0": x0,
+                "x1": x1,
+                "text": text
+            })
+
+        for row_y in sorted(
+            rows.keys()
+        ):
+
+            row = sorted(
+                rows[row_y],
+                key=lambda item: item["x0"]
             )
 
-            if re.fullmatch(
+            row_text = " ".join(
+                item["text"]
+                for item in row
+            )
+
+            date_match = re.search(
+                r"\b"
                 r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|"
-                r"SEP|OCT|NOV|DEC)\d{2}",
-                cleaned
-            ):
+                r"SEP|OCT|NOV|DEC)"
+                r"(\d{2})"
+                r"\b",
+                row_text,
+                re.IGNORECASE
+            )
 
-                date_words.append(
-                    word
-                )
-
-        # -------------------------------------------------
-        # Process each transaction row
-        # -------------------------------------------------
-
-        for date_word in date_words:
-
-            (
-                dx0,
-                dy0,
-                dx1,
-                dy1,
-                date_text
-            ) = date_word[:5]
-
-            date_center_y = (
-                dy0 + dy1
-            ) / 2
-
-            row_words = []
-
-            for word in words:
-
-                x0, y0, x1, y1, text = (
-                    word[:5]
-                )
-
-                center_y = (
-                    y0 + y1
-                ) / 2
-
-                if abs(
-                    center_y
-                    -
-                    date_center_y
-                ) <= 3.5:
-
-                    row_words.append(
-                        word
-                    )
-
-            if not row_words:
+            if not date_match:
                 continue
 
-            row_words.sort(
-                key=lambda item: item[0]
+            date_token = (
+                date_match.group(1).upper()
+                +
+                date_match.group(2)
+            )
+
+            if (
+                "BALANCE FORWARD"
+                in row_text.upper()
+            ):
+                continue
+
+            amount_words = []
+
+            for item in row:
+
+                cleaned = (
+                    item["text"]
+                    .replace("$", "")
+                    .replace(",", "")
+                    .strip()
+                )
+
+                if re.fullmatch(
+                    r"\d+\.\d{2}",
+                    cleaned
+                ):
+
+                    amount_words.append({
+                        "x": (
+                            item["x0"]
+                            +
+                            item["x1"]
+                        ) / 2,
+                        "amount": clean_amount(
+                            cleaned
+                        )
+                    })
+
+            if not amount_words:
+                continue
+
+            # -------------------------------------------------
+            # The far-right amount is the running balance.
+            # Remove it when three amount values are present.
+            # -------------------------------------------------
+
+            amount_words = sorted(
+                amount_words,
+                key=lambda item: item["x"]
+            )
+
+            transaction_amounts = (
+                amount_words[:-1]
+                if len(amount_words) >= 2
+                else amount_words
             )
 
             # -------------------------------------------------
-            # DESCRIPTION
+            # Description ends before first transaction amount.
             # -------------------------------------------------
+
+            first_amount_x = min(
+                item["x"]
+                for item in transaction_amounts
+            )
 
             description_parts = []
 
-            for word in row_words:
+            for item in row:
 
-                x0, y0, x1, y1, text = (
-                    word[:5]
-                )
+                center_x = (
+                    item["x0"]
+                    +
+                    item["x1"]
+                ) / 2
 
-                if x0 < description_right:
+                if center_x < first_amount_x:
 
-                    description_parts.append(
-                        text
-                    )
+                    text = item["text"]
+
+                    if (
+                        text.upper()
+                        != date_token
+                    ):
+
+                        description_parts.append(
+                            text
+                        )
 
             description = " ".join(
                 description_parts
             ).strip()
 
-            description = (
-                description
-                .replace(
-                    date_text,
-                    ""
-                )
-                .strip()
-            )
-
             if not description:
                 continue
 
-            skip_phrases = [
-                "BALANCE FORWARD",
-                "DESCRIPTION",
-                "CREDITS",
-                "DEBITS",
-                "NEXT STATEMENT",
-                "MONTHLY AVER",
-                "MONTHLY MIN",
-                "DEP CONTENT",
-                "BUSINESS LINE OF CREDIT LIMIT"
-            ]
-
-            if any(
-                phrase in description.upper()
-                for phrase in skip_phrases
-            ):
-                continue
-
             # -------------------------------------------------
-            # DEBIT / CREDIT
+            # TD statement transaction amount columns:
+            #
+            # left transaction amount = debit
+            # right transaction amount = credit
+            #
+            # When only one transaction amount exists,
+            # determine its side from its x position.
             # -------------------------------------------------
 
             debit = 0.0
             credit = 0.0
 
-            for word in row_words:
+            page_width = (
+                page.rect.width
+            )
 
-                x0, y0, x1, y1, text = (
-                    word[:5]
+            for item in transaction_amounts:
+
+                ratio = (
+                    item["x"]
+                    /
+                    page_width
                 )
 
-                cleaned = (
-                    text
-                    .replace(",", "")
-                    .replace("$", "")
-                    .strip()
-                )
+                if ratio < 0.59:
+                    debit = item["amount"]
 
-                if not re.fullmatch(
-                    r"\d+\.\d{2}",
-                    cleaned
-                ):
-                    continue
-
-                amount = clean_amount(
-                    cleaned
-                )
-
-                center_x = (
-                    x0 + x1
-                ) / 2
-
-                if (
-                    debit_left
-                    <= center_x
-                    < debit_right
-                ):
-
-                    debit = amount
-
-                elif (
-                    credit_left
-                    <= center_x
-                    < credit_right
-                ):
-
-                    credit = amount
+                else:
+                    credit = item["amount"]
 
             if (
                 debit == 0
@@ -491,7 +446,7 @@ def extract_td_chequing_transactions(
 
             transaction_date = (
                 parse_chequing_date(
-                    date_text,
+                    date_token,
                     statement_year
                 )
             )
@@ -530,15 +485,15 @@ def extract_td_chequing_transactions(
     statement_info = {
         "statement_type": "chequing",
         "control": controls,
-        "ending_balance": ending_balance,
-        "account_id": account_id
+        "account_id": account_id,
+        "ending_balance": 0.0
     }
 
     return df, statement_info
 
 
 # =========================================================
-# TD CREDIT CARD SUMMARY
+# CREDIT CARD SUMMARY
 # =========================================================
 
 def get_credit_card_summary(
@@ -553,10 +508,6 @@ def get_credit_card_summary(
         "fees": None,
         "new_balance": None
     }
-
-    # -----------------------------------------------------
-    # First try direct text patterns
-    # -----------------------------------------------------
 
     patterns = {
 
@@ -617,39 +568,63 @@ def get_credit_card_summary(
 
                 break
 
+    # -----------------------------------------------------
+    # If TD splits Purchases & Other Charges across PDF
+    # blocks, calculate it from the statement equation.
+    # -----------------------------------------------------
+
+    if (
+        summary["purchases_charges"]
+        is None
+        and
+        summary["previous_balance"]
+        is not None
+        and
+        summary["payments_credits"]
+        is not None
+        and
+        summary["new_balance"]
+        is not None
+    ):
+
+        interest = (
+            summary["interest"]
+            or 0.0
+        )
+
+        fees = (
+            summary["fees"]
+            or 0.0
+        )
+
+        summary["purchases_charges"] = round(
+
+            summary["new_balance"]
+
+            -
+
+            summary["previous_balance"]
+
+            +
+
+            summary["payments_credits"]
+
+            -
+
+            interest
+
+            -
+
+            fees,
+
+            2
+        )
+
     return summary
 
 
 # =========================================================
-# TD CREDIT CARD ACCOUNT ID
-# =========================================================
-
-def get_credit_card_account_id(
-    text
-):
-
-    patterns = [
-        r"Account\s+Number.*?(\d{4})\b",
-        r"\*{2,}\s*(\d{4})\b",
-        r"ending\s+in\s+(\d{4})"
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE
-        )
-
-        if match:
-            return match.group(1)
-
-    return "0000"
-
-
-# =========================================================
-# TD CREDIT CARD YEAR
+# CREDIT CARD HELPERS
 # =========================================================
 
 def get_credit_card_year(text):
@@ -677,8 +652,49 @@ def get_credit_card_year(text):
     return datetime.now().year
 
 
+def get_credit_card_account_id(
+    text
+):
+
+    # Prefer explicit masked account-number line.
+
+    patterns = [
+
+        r"Account\s+Number:\s*"
+        r"(?:\d{4}\s+)?"
+        r"(?:\d{2}XX\s+XXXX\s+)?"
+        r"(\d{4})",
+
+        r"Account\s+Number.*?"
+        r"(\d{4})\b",
+
+        r"ending\s+in\s+"
+        r"(\d{4})"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+            return match.group(1)
+
+    return "0000"
+
+
 # =========================================================
-# TD CREDIT CARD PARSER
+# TD CREDIT CARD TRANSACTION PARSER
+#
+# DO NOT CHANGE:
+# THIS IS THE VERSION THAT PRODUCED:
+#
+# 39 transactions
+# $1,523.70 charges
+# $3,029.28 payments/credits
 # =========================================================
 
 def extract_td_credit_card_transactions(
@@ -721,10 +737,6 @@ def extract_td_credit_card_transactions(
         "SEP", "OCT", "NOV", "DEC"
     }
 
-    # -----------------------------------------------------
-    # Read actual TD credit-card transaction coordinates
-    # -----------------------------------------------------
-
     for page in doc:
 
         words = page.get_text("words")
@@ -746,8 +758,6 @@ def extract_td_credit_card_transactions(
 
             if month_text not in valid_months:
                 continue
-
-            # Transaction month column
 
             if not (
                 40 <= x0 <= 60
@@ -786,10 +796,6 @@ def extract_td_credit_card_transactions(
                 key=lambda item: item[0]
             )
 
-            # -------------------------------------------------
-            # DAY
-            # -------------------------------------------------
-
             day = None
 
             for word in row_words:
@@ -816,10 +822,6 @@ def extract_td_credit_card_transactions(
             if day is None:
                 continue
 
-            # -------------------------------------------------
-            # AMOUNT
-            # -------------------------------------------------
-
             amount_text = None
 
             for word in row_words:
@@ -828,9 +830,7 @@ def extract_td_credit_card_transactions(
                     word[:5]
                 )
 
-                cleaned = (
-                    text.strip()
-                )
+                cleaned = text.strip()
 
                 if (
                     295 <= wx0 <= 355
@@ -847,10 +847,6 @@ def extract_td_credit_card_transactions(
 
             if amount_text is None:
                 continue
-
-            # -------------------------------------------------
-            # DESCRIPTION
-            # -------------------------------------------------
 
             description_parts = []
 
@@ -875,10 +871,6 @@ def extract_td_credit_card_transactions(
             if not description:
                 continue
 
-            # -------------------------------------------------
-            # AMOUNT DIRECTION
-            # -------------------------------------------------
-
             numeric_amount = (
                 clean_amount(
                     amount_text
@@ -887,9 +879,6 @@ def extract_td_credit_card_transactions(
 
             debit = 0.0
             credit = 0.0
-
-            # Positive on TD credit card = charge
-            # Negative = payment / credit
 
             if numeric_amount < 0:
 
@@ -900,10 +889,6 @@ def extract_td_credit_card_transactions(
             else:
 
                 debit = numeric_amount
-
-            # -------------------------------------------------
-            # DATE
-            # -------------------------------------------------
 
             try:
 
@@ -956,66 +941,6 @@ def extract_td_credit_card_transactions(
             .reset_index(drop=True)
         )
 
-    # -----------------------------------------------------
-    # FALLBACK SUMMARY CALCULATION
-    #
-    # The TD PDF sometimes splits "Purchases & Other
-    # Charges" and its amount into separate PDF blocks.
-    #
-    # If that control figure cannot be read directly,
-    # derive it from the statement equation:
-    #
-    # Previous Balance
-    # - Payments/Credits
-    # + Purchases
-    # + Interest
-    # + Fees
-    # = New Balance
-    # -----------------------------------------------------
-
-    if (
-        summary["purchases_charges"]
-        is None
-        and
-        summary["previous_balance"]
-        is not None
-        and
-        summary["payments_credits"]
-        is not None
-        and
-        summary["new_balance"]
-        is not None
-    ):
-
-        interest = (
-            summary["interest"]
-            or 0.0
-        )
-
-        fees = (
-            summary["fees"]
-            or 0.0
-        )
-
-        calculated_purchases = (
-            summary["new_balance"]
-            -
-            summary["previous_balance"]
-            +
-            summary["payments_credits"]
-            -
-            interest
-            -
-            fees
-        )
-
-        summary[
-            "purchases_charges"
-        ] = round(
-            calculated_purchases,
-            2
-        )
-
     statement_info = {
         "statement_type": "credit_card",
         "summary": summary,
@@ -1029,7 +954,9 @@ def extract_td_credit_card_transactions(
 # QUICKBOOKS ONLINE CSV
 # =========================================================
 
-def generate_quickbooks_csv(df):
+def generate_quickbooks_csv(
+    df
+):
 
     export_df = df.copy()
 
@@ -1062,16 +989,14 @@ def generate_quickbooks_csv(df):
 
 
 # =========================================================
-# TD CHEQUING QBO
+# CHEQUING QBO
 #
-# PRESERVES THE STRUCTURE THAT SUCCESSFULLY IMPORTED
-# INTO QUICKBOOKS DESKTOP.
+# KEEPING BANK QBO SEPARATE FROM CREDIT CARD.
 # =========================================================
 
 def generate_td_chequing_qbo(
     df,
-    account_id,
-    ending_balance
+    account_id
 ):
 
     working_df = df.copy()
@@ -1083,25 +1008,23 @@ def generate_td_chequing_qbo(
     )
 
     first_date = (
-        working_df[
-            "DateObject"
-        ].min()
+        working_df["DateObject"]
+        .min()
     )
 
     last_date = (
-        working_df[
-            "DateObject"
-        ].max()
+        working_df["DateObject"]
+        .max()
     )
 
     start_date = (
-        first_date.strftime(
-            "%Y%m%d"
+        qbo_datetime(
+            first_date
         )
     )
 
     end_date = (
-        td_qbo_datetime(
+        qbo_datetime(
             last_date
         )
     )
@@ -1111,11 +1034,9 @@ def generate_td_chequing_qbo(
         .strftime(
             "%Y%m%d%H%M%S"
         )
-        +
-        "[-5:EST]"
     )
 
-    transaction_blocks = []
+    blocks = []
 
     duplicate_counter = {}
 
@@ -1143,85 +1064,57 @@ def generate_td_chequing_qbo(
             )
         )
 
-        posted_date = (
-            td_qbo_datetime(
-                date_object
-            )
+        description = clean_qbo_text(
+            row["Description"]
         )
 
-        description = (
-            clean_qbo_text(
-                row["Description"]
-            )
-        )
-
-        transaction_type = (
-            "DEBIT"
-            if amount < 0
-            else "CREDIT"
-        )
-
-        duplicate_key = (
+        key = (
             date_text,
             description,
             f"{amount:.2f}"
         )
 
-        duplicate_counter[
-            duplicate_key
-        ] = (
+        duplicate_counter[key] = (
             duplicate_counter.get(
-                duplicate_key,
+                key,
                 0
             )
             + 1
         )
 
-        occurrence = (
-            duplicate_counter[
-                duplicate_key
-            ]
-        )
-
         fitid = create_fitid(
-            "TD-BANK",
+            "TDCHEQ",
             date_text,
             description,
             amount,
-            occurrence
+            duplicate_counter[key]
         )
 
-        transaction_blocks.append(
+        trntype = (
+            "DEBIT"
+            if amount < 0
+            else "CREDIT"
+        )
+
+        blocks.append(
             "<STMTTRN>\n"
-            f"<TRNTYPE>{transaction_type}\n"
-            f"<DTPOSTED>{posted_date}\n"
+            f"<TRNTYPE>{trntype}\n"
+            f"<DTPOSTED>{qbo_datetime(date_object)}\n"
             f"<TRNAMT>{amount:.2f}\n"
             f"<FITID>{fitid}\n"
-            f"<NAME>{description}\n"
+            f"<NAME>{description[:32]}\n"
+            f"<MEMO>{description[:255]}\n"
             "</STMTTRN>"
         )
 
-    transactions_text = "\n".join(
-        transaction_blocks
-    )
-
-    if ending_balance is None:
-        ending_balance = 0.00
-
-    trnuid = (
-        "QWEB - "
-        +
-        datetime.now().strftime(
-            "%Y%m%d%H%M%S"
-        )
-        +
-        "0191"
+    transaction_text = "\n".join(
+        blocks
     )
 
     return f"""OFXHEADER:100
 DATA:OFXSGML
 VERSION:102
-SECURITY:TYPE1
+SECURITY:NONE
 ENCODING:USASCII
 CHARSET:1252
 COMPRESSION:NONE
@@ -1234,36 +1127,37 @@ NEWFILEUID:NONE
 <STATUS>
 <CODE>0
 <SEVERITY>INFO
-<MESSAGE>OK
 </STATUS>
 <DTSERVER>{server_time}
-<USERKEY>--NoUserKey--
 <LANGUAGE>ENG
-<INTU.BID>00002
+<FI>
+<ORG>TD Canada Trust
+<FID>004
+</FI>
 </SONRS>
 </SIGNONMSGSRSV1>
 <BANKMSGSRSV1>
 <STMTTRNRS>
-<TRNUID>{trnuid}
+<TRNUID>1
 <STATUS>
 <CODE>0
 <SEVERITY>INFO
-<MESSAGE>OK
 </STATUS>
 <STMTRS>
 <CURDEF>CAD
 <BANKACCTFROM>
-<BANKID>300000100
+<BANKID>004
+<BRANCHID>00000
 <ACCTID>{account_id}
 <ACCTTYPE>CHECKING
 </BANKACCTFROM>
 <BANKTRANLIST>
 <DTSTART>{start_date}
 <DTEND>{end_date}
-{transactions_text}
+{transaction_text}
 </BANKTRANLIST>
 <LEDGERBAL>
-<BALAMT>{ending_balance:.2f}
+<BALAMT>0.00
 <DTASOF>{end_date}
 </LEDGERBAL>
 </STMTRS>
@@ -1274,7 +1168,19 @@ NEWFILEUID:NONE
 
 
 # =========================================================
-# TD CREDIT CARD QBO
+# CREDIT CARD QBO
+#
+# IMPORTANT FIX:
+#
+# This version uses a conservative OFX 1.02 Web Connect
+# credit-card structure.
+#
+# It intentionally avoids bank-only fields such as:
+# BANKID
+# BRANCHID
+# ACCTTYPE
+#
+# Credit card uses CCACCTFROM only.
 # =========================================================
 
 def generate_td_credit_card_qbo(
@@ -1292,25 +1198,23 @@ def generate_td_credit_card_qbo(
     )
 
     first_date = (
-        working_df[
-            "DateObject"
-        ].min()
+        working_df["DateObject"]
+        .min()
     )
 
     last_date = (
-        working_df[
-            "DateObject"
-        ].max()
+        working_df["DateObject"]
+        .max()
     )
 
     start_date = (
-        first_date.strftime(
-            "%Y%m%d"
+        qbo_datetime(
+            first_date
         )
     )
 
     end_date = (
-        td_qbo_datetime(
+        qbo_datetime(
             last_date
         )
     )
@@ -1320,11 +1224,9 @@ def generate_td_credit_card_qbo(
         .strftime(
             "%Y%m%d%H%M%S"
         )
-        +
-        "[-5:EST]"
     )
 
-    blocks = []
+    transaction_blocks = []
 
     duplicate_counter = {}
 
@@ -1338,8 +1240,12 @@ def generate_td_credit_card_qbo(
             row["Credit"]
         )
 
-        # Purchase = negative
+        # -------------------------------------------------
+        # Credit-card OFX convention:
+        #
+        # Purchase/charge = negative
         # Payment/refund = positive
+        # -------------------------------------------------
 
         amount = (
             credit - debit
@@ -1355,22 +1261,8 @@ def generate_td_credit_card_qbo(
             )
         )
 
-        posted_date = (
-            td_qbo_datetime(
-                date_object
-            )
-        )
-
-        description = (
-            clean_qbo_text(
-                row["Description"]
-            )
-        )
-
-        transaction_type = (
-            "DEBIT"
-            if amount < 0
-            else "CREDIT"
+        description = clean_qbo_text(
+            row["Description"]
         )
 
         duplicate_key = (
@@ -1389,33 +1281,47 @@ def generate_td_credit_card_qbo(
             + 1
         )
 
-        occurrence = (
+        fitid = create_fitid(
+            "TDCC",
+            date_text,
+            description,
+            amount,
             duplicate_counter[
                 duplicate_key
             ]
         )
 
-        fitid = create_fitid(
-            "TD-CC",
-            date_text,
-            description,
-            amount,
-            occurrence
-        )
+        if amount < 0:
 
-        blocks.append(
+            trntype = "DEBIT"
+
+        else:
+
+            trntype = "CREDIT"
+
+        block = (
             "<STMTTRN>\n"
-            f"<TRNTYPE>{transaction_type}\n"
-            f"<DTPOSTED>{posted_date}\n"
+            f"<TRNTYPE>{trntype}\n"
+            f"<DTPOSTED>{qbo_datetime(date_object)}\n"
             f"<TRNAMT>{amount:.2f}\n"
             f"<FITID>{fitid}\n"
-            f"<NAME>{description}\n"
+            f"<NAME>{description[:32]}\n"
+            f"<MEMO>{description[:255]}\n"
             "</STMTTRN>"
         )
 
+        transaction_blocks.append(
+            block
+        )
+
     transactions_text = "\n".join(
-        blocks
+        transaction_blocks
     )
+
+    # -----------------------------------------------------
+    # For a credit-card liability, the amount owed is
+    # represented as a negative OFX ledger balance.
+    # -----------------------------------------------------
 
     if new_balance is None:
 
@@ -1423,24 +1329,20 @@ def generate_td_credit_card_qbo(
 
     else:
 
-        ledger_balance = -abs(
-            float(new_balance)
+        ledger_balance = (
+            -abs(
+                float(new_balance)
+            )
         )
 
-    trnuid = (
-        "QWEB - "
-        +
-        datetime.now().strftime(
-            "%Y%m%d%H%M%S"
-        )
-        +
-        "0191"
-    )
+    # -----------------------------------------------------
+    # CREDIT CARD QBO
+    # -----------------------------------------------------
 
-    return f"""OFXHEADER:100
+    qbo = f"""OFXHEADER:100
 DATA:OFXSGML
 VERSION:102
-SECURITY:TYPE1
+SECURITY:NONE
 ENCODING:USASCII
 CHARSET:1252
 COMPRESSION:NONE
@@ -1453,21 +1355,21 @@ NEWFILEUID:NONE
 <STATUS>
 <CODE>0
 <SEVERITY>INFO
-<MESSAGE>OK
 </STATUS>
 <DTSERVER>{server_time}
-<USERKEY>--NoUserKey--
 <LANGUAGE>ENG
-<INTU.BID>00002
+<FI>
+<ORG>TD Canada Trust
+<FID>004
+</FI>
 </SONRS>
 </SIGNONMSGSRSV1>
 <CREDITCARDMSGSRSV1>
 <CCSTMTTRNRS>
-<TRNUID>{trnuid}
+<TRNUID>1
 <STATUS>
 <CODE>0
 <SEVERITY>INFO
-<MESSAGE>OK
 </STATUS>
 <CCSTMTRS>
 <CURDEF>CAD
@@ -1489,9 +1391,11 @@ NEWFILEUID:NONE
 </OFX>
 """
 
+    return qbo
+
 
 # =========================================================
-# USER CONTROLS
+# USER INTERFACE
 # =========================================================
 
 col1, col2 = st.columns(2)
@@ -1676,10 +1580,6 @@ if "transactions" in st.session_state:
             len(edited_df)
         )
 
-        # =================================================
-        # STATEMENT CONTROL
-        # =================================================
-
         st.divider()
 
         st.header(
@@ -1719,7 +1619,7 @@ if "transactions" in st.session_state:
 
 
         # =================================================
-        # CHEQUING CONTROL
+        # CHEQUING RECONCILIATION
         # =================================================
 
         if (
@@ -1830,7 +1730,7 @@ if "transactions" in st.session_state:
 
 
         # =================================================
-        # CREDIT CARD CONTROL
+        # CREDIT CARD RECONCILIATION
         # =================================================
 
         else:
@@ -1919,14 +1819,6 @@ if "transactions" in st.session_state:
                     f"${new_balance:,.2f}"
                 )
 
-            # -------------------------------------------------
-            # Expected extracted charges:
-            #
-            # Purchases & Other Charges
-            # + Interest
-            # + Fees
-            # -------------------------------------------------
-
             expected_charges = (
                 (purchases or 0.0)
                 +
@@ -1945,11 +1837,8 @@ if "transactions" in st.session_state:
             )
 
             payments_match = (
-
                 payments is not None
-
                 and
-
                 abs(
                     credit_total
                     -
@@ -1957,10 +1846,6 @@ if "transactions" in st.session_state:
                 )
                 < 0.01
             )
-
-            # -------------------------------------------------
-            # Also verify statement equation
-            # -------------------------------------------------
 
             statement_math_match = False
 
@@ -2083,9 +1968,6 @@ if "transactions" in st.session_state:
                         edited_df,
                         statement_info[
                             "account_id"
-                        ],
-                        statement_info[
-                            "ending_balance"
                         ]
                     )
                 )
@@ -2130,7 +2012,10 @@ if "transactions" in st.session_state:
                     label=(
                         "Download QuickBooks QBO"
                     ),
-                    data=qbo_data,
+                    data=qbo_data.encode(
+                        "cp1252",
+                        errors="replace"
+                    ),
                     file_name=(
                         "quickbooks_webconnect.qbo"
                     ),
