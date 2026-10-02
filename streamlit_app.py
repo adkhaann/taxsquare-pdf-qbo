@@ -2,12 +2,12 @@ import streamlit as st
 import pandas as pd
 import fitz
 import re
-import hashlib
 from datetime import datetime
+from io import BytesIO
 
 
 # =========================================================
-# PAGE SETTINGS
+# PAGE SETUP
 # =========================================================
 
 st.set_page_config(
@@ -17,10 +17,9 @@ st.set_page_config(
 )
 
 st.title("PDF to QuickBooks Converter")
-
 st.write(
-    "Convert TD bank and credit-card PDF statements into "
-    "QuickBooks Online CSV or QuickBooks Desktop QBO files."
+    "Convert TD bank and credit card PDF statements "
+    "into QuickBooks-ready CSV and QBO files."
 )
 
 st.divider()
@@ -30,13 +29,15 @@ st.divider()
 # GENERAL HELPERS
 # =========================================================
 
-def money_to_float(value):
+def clean_amount(value):
 
     if value is None:
         return 0.0
 
+    value = str(value)
+
     value = (
-        str(value)
+        value
         .replace(",", "")
         .replace("$", "")
         .replace("(", "-")
@@ -50,85 +51,46 @@ def money_to_float(value):
         return 0.0
 
 
-def clean_qbo_text(text):
-
-    text = str(text)
-
-    text = text.replace("&", "and")
-    text = text.replace("<", "")
-    text = text.replace(">", "")
-
-    return text.strip()[:255]
+def money_to_float(value):
+    return clean_amount(value)
 
 
-def create_fitid(prefix, date_text, description, amount, occurrence):
+def extract_statement_year(text):
 
-    source = (
-        f"{prefix}|"
-        f"{date_text}|"
-        f"{description}|"
-        f"{amount:.2f}|"
-        f"{occurrence}"
-    )
-
-    digest = hashlib.sha256(
-        source.encode("utf-8")
-    ).hexdigest()
-
-    return str(
-        int(digest[:14], 16)
-    )
-
-
-def td_qbo_datetime(date_object):
-
-    return (
-        date_object.strftime("%Y%m%d")
-        + "020000[-5:EST]"
-    )
-
-
-# =========================================================
-# TD CHEQUING HELPERS
-# =========================================================
-
-def parse_td_chequing_date(date_text, statement_year):
-
-    try:
-
-        parsed = datetime.strptime(
-            f"{date_text.strip().upper()}{statement_year}",
-            "%b%d%Y"
-        )
-
-        return parsed.strftime("%Y-%m-%d")
-
-    except:
-        return date_text
-
-
-def get_chequing_statement_year(text):
+    # First try normal statement date
 
     match = re.search(
-        r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
-        r"\s+\d{1,2}/(\d{2})",
+        r"STATEMENT DATE:\s*"
+        r"(?:January|February|March|April|May|June|July|"
+        r"August|September|October|November|December)"
+        r"\s+\d{1,2},\s*(20\d{2})",
         text,
         re.IGNORECASE
     )
 
     if match:
-        return 2000 + int(match.group(1))
+        return int(match.group(1))
+
+    # TD chequing statement format
+
+    match = re.search(
+        r"([A-Z]{3})\s*(\d{1,2})/(\d{2})\s*-\s*"
+        r"([A-Z]{3})\s*(\d{1,2})/(\d{2})",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        return 2000 + int(match.group(6))
 
     return datetime.now().year
 
 
-def get_chequing_control_totals(text):
+# =========================================================
+# TD CHEQUING CONTROL TOTALS
+# =========================================================
 
-    credit_count = None
-    credit_total = None
-
-    debit_count = None
-    debit_total = None
+def get_td_chequing_control_totals(text):
 
     credit_match = re.search(
         r"Credits\s+(\d+)\s+([\d,]+\.\d{2})",
@@ -142,84 +104,38 @@ def get_chequing_control_totals(text):
         re.IGNORECASE
     )
 
+    result = {
+        "credit_count": None,
+        "credit_total": None,
+        "debit_count": None,
+        "debit_total": None
+    }
+
     if credit_match:
 
-        credit_count = int(
+        result["credit_count"] = int(
             credit_match.group(1)
         )
 
-        credit_total = money_to_float(
+        result["credit_total"] = clean_amount(
             credit_match.group(2)
         )
 
     if debit_match:
 
-        debit_count = int(
+        result["debit_count"] = int(
             debit_match.group(1)
         )
 
-        debit_total = money_to_float(
+        result["debit_total"] = clean_amount(
             debit_match.group(2)
         )
 
-    return {
-        "credit_count": credit_count,
-        "credit_total": credit_total,
-        "debit_count": debit_count,
-        "debit_total": debit_total
-    }
-
-
-def get_td_chequing_ending_balance(text):
-
-    lines = text.splitlines()
-
-    candidates = []
-
-    for line in lines:
-
-        match = re.search(
-            r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
-            r"\d{2}\s+"
-            r"([\d,]+\.\d{2})"
-            r"(OD)?\s*$",
-            line.strip(),
-            re.IGNORECASE
-        )
-
-        if match:
-
-            amount = money_to_float(
-                match.group(2)
-            )
-
-            if match.group(3):
-                amount = -amount
-
-            candidates.append(amount)
-
-    if candidates:
-        return candidates[-1]
-
-    return None
-
-
-def get_td_chequing_account_id(text):
-
-    match = re.search(
-        r"\b\d{4}\s+\d{4}-(\d{7})\b",
-        text
-    )
-
-    if match:
-        return match.group(1)
-
-    return "5263645"
+    return result
 
 
 # =========================================================
 # TD CHEQUING PARSER
-# KEEP THIS LOGIC SEPARATE FROM CREDIT CARD
 # =========================================================
 
 def extract_td_chequing_transactions(pdf_bytes):
@@ -229,206 +145,193 @@ def extract_td_chequing_transactions(pdf_bytes):
         filetype="pdf"
     )
 
-    transactions = []
-
     full_text = ""
 
     for page in doc:
         full_text += page.get_text("text") + "\n"
 
-    statement_year = get_chequing_statement_year(
+    statement_year = extract_statement_year(
         full_text
     )
 
-    control = get_chequing_control_totals(
+    controls = get_td_chequing_control_totals(
         full_text
     )
 
-    ending_balance = get_td_chequing_ending_balance(
-        full_text
-    )
+    transactions = []
 
-    account_id = get_td_chequing_account_id(
-        full_text
-    )
+    valid_months = {
+        "JAN", "FEB", "MAR", "APR",
+        "MAY", "JUN", "JUL", "AUG",
+        "SEP", "OCT", "NOV", "DEC"
+    }
 
     for page in doc:
 
         words = page.get_text("words")
 
-        if not words:
-            continue
-
-        page_width = page.rect.width
-
-        debit_left = page_width * 0.31
-        debit_right = page_width * 0.47
-
-        credit_left = page_width * 0.47
-        credit_right = page_width * 0.63
-
-        description_right = debit_left
-
-        date_words = []
+        rows = {}
 
         for word in words:
 
-            x0, y0, x1, y1, text, block, line, word_no = word
+            x0, y0, x1, y1, text = word[:5]
 
-            cleaned = text.strip().upper()
+            row_key = round(y0 / 3) * 3
 
-            if re.fullmatch(
-                r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}",
-                cleaned
-            ):
+            if row_key not in rows:
+                rows[row_key] = []
 
-                date_words.append(word)
+            rows[row_key].append({
+                "x": x0,
+                "text": text
+            })
 
-        for date_word in date_words:
+        for y in sorted(rows.keys()):
 
-            (
-                dx0,
-                dy0,
-                dx1,
-                dy1,
-                date_text,
-                _,
-                _,
-                _
-            ) = date_word
+            row_words = sorted(
+                rows[y],
+                key=lambda item: item["x"]
+            )
 
-            row_words = []
+            row_text = " ".join(
+                item["text"]
+                for item in row_words
+            )
 
-            tolerance = 3.5
+            date_match = re.search(
+                r"\b"
+                r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|"
+                r"SEP|OCT|NOV|DEC)"
+                r"(\d{2})"
+                r"\b",
+                row_text,
+                re.IGNORECASE
+            )
 
-            date_center_y = (
-                dy0 + dy1
-            ) / 2
-
-            for word in words:
-
-                (
-                    x0,
-                    y0,
-                    x1,
-                    y1,
-                    text,
-                    block,
-                    line,
-                    word_no
-                ) = word
-
-                center_y = (
-                    y0 + y1
-                ) / 2
-
-                if abs(
-                    center_y - date_center_y
-                ) <= tolerance:
-
-                    row_words.append(word)
-
-            if not row_words:
+            if not date_match:
                 continue
 
-            row_words.sort(
-                key=lambda w: w[0]
+            if "BALANCE FORWARD" in row_text.upper():
+                continue
+
+            month = date_match.group(1).upper()
+
+            if month not in valid_months:
+                continue
+
+            day = int(
+                date_match.group(2)
             )
 
             description_parts = []
 
-            for word in row_words:
+            amount_candidates = []
 
-                x0, y0, x1, y1, text, *_ = word
+            for item in row_words:
 
-                if x0 < description_right:
-                    description_parts.append(text)
+                x = item["x"]
+                text = item["text"]
+
+                if re.fullmatch(
+                    r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|"
+                    r"SEP|OCT|NOV|DEC)\d{2}",
+                    text,
+                    re.IGNORECASE
+                ):
+                    continue
+
+                if x < 300:
+
+                    description_parts.append(
+                        text
+                    )
+
+                if re.fullmatch(
+                    r"[\d,]+\.\d{2}",
+                    text
+                ):
+
+                    amount_candidates.append(
+                        (x, text)
+                    )
 
             description = " ".join(
                 description_parts
             ).strip()
 
-            description = description.replace(
-                date_text,
-                ""
-            ).strip()
+            if not description:
+                continue
 
-            upper_description = (
-                description.upper()
-            )
-
-            skip_phrases = [
-                "BALANCE FORWARD",
+            skip_words = [
+                "DESCRIPTION",
+                "CREDITS",
+                "DEBITS",
                 "NEXT STATEMENT",
                 "MONTHLY AVER",
                 "MONTHLY MIN",
-                "DEP CONTENT",
-                "BUSINESS LINE OF CREDIT LIMIT"
+                "DEP CONTENT"
             ]
 
             if any(
-                phrase in upper_description
-                for phrase in skip_phrases
+                phrase in description.upper()
+                for phrase in skip_words
             ):
                 continue
 
-            if description == "":
+            if not amount_candidates:
                 continue
+
+            # -------------------------------------------------
+            # IMPORTANT:
+            # Working TD chequing structure.
+            #
+            # Credits are farther left.
+            # Debits are farther right.
+            # Balance column is ignored.
+            # -------------------------------------------------
 
             debit = 0.0
             credit = 0.0
 
-            for word in row_words:
+            for x, amount_text in amount_candidates:
 
-                x0, y0, x1, y1, text, *_ = word
-
-                cleaned = (
-                    text
-                    .replace(",", "")
-                    .replace("$", "")
-                    .strip()
+                amount = clean_amount(
+                    amount_text
                 )
 
-                if not re.fullmatch(
-                    r"\d+\.\d{2}",
-                    cleaned
-                ):
-                    continue
+                # Credit / deposit column
 
-                amount = money_to_float(
-                    cleaned
-                )
-
-                center_x = (
-                    x0 + x1
-                ) / 2
-
-                if (
-                    debit_left
-                    <= center_x
-                    < debit_right
-                ):
-
-                    debit = amount
-
-                elif (
-                    credit_left
-                    <= center_x
-                    < credit_right
-                ):
+                if 300 <= x < 390:
 
                     credit = amount
+
+                # Debit / withdrawal column
+
+                elif 390 <= x < 500:
+
+                    debit = amount
 
             if debit == 0 and credit == 0:
                 continue
 
-            formatted_date = parse_td_chequing_date(
-                date_text,
-                statement_year
-            )
+            try:
+
+                transaction_date = (
+                    datetime.strptime(
+                        f"{month} {day:02d} {statement_year}",
+                        "%b %d %Y"
+                    )
+                    .strftime("%Y-%m-%d")
+                )
+
+            except:
+
+                transaction_date = (
+                    f"{month} {day:02d} {statement_year}"
+                )
 
             transactions.append({
-                "Date": formatted_date,
+                "Date": transaction_date,
                 "Description": description,
                 "Debit": debit,
                 "Credit": credit
@@ -436,19 +339,11 @@ def extract_td_chequing_transactions(pdf_bytes):
 
     doc.close()
 
-    df = pd.DataFrame(transactions)
+    df = pd.DataFrame(
+        transactions
+    )
 
     if not df.empty:
-
-        df["Debit"] = pd.to_numeric(
-            df["Debit"],
-            errors="coerce"
-        ).fillna(0)
-
-        df["Credit"] = pd.to_numeric(
-            df["Credit"],
-            errors="coerce"
-        ).fillna(0)
 
         df = (
             df
@@ -456,167 +351,7 @@ def extract_td_chequing_transactions(pdf_bytes):
             .reset_index(drop=True)
         )
 
-    statement_info = {
-        "control": control,
-        "ending_balance": ending_balance,
-        "account_id": account_id,
-        "statement_type": "chequing"
-    }
-
-    return df, statement_info
-
-
-# =========================================================
-# TD CREDIT CARD HELPERS
-# =========================================================
-
-def get_credit_card_year(text):
-
-    # Look for statement period ending date first
-
-    patterns = [
-        r"Statement\s+Period.*?"
-        r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
-        r"\s+\d{1,2},?\s+(20\d{2})",
-
-        r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
-        r"\s+\d{1,2},\s+(20\d{2})"
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE | re.DOTALL
-        )
-
-        if match:
-
-            if len(match.groups()) >= 2:
-                return int(match.group(2))
-
-    # Uploaded statement is 2026, but don't hard-code
-    # unless no year can be extracted.
-
-    year_match = re.search(
-        r"\b(20\d{2})\b",
-        text
-    )
-
-    if year_match:
-        return int(year_match.group(1))
-
-    return datetime.now().year
-
-
-def parse_credit_card_date(month, day, year):
-
-    try:
-
-        parsed = datetime.strptime(
-            f"{month} {day} {year}",
-            "%b %d %Y"
-        )
-
-        return parsed.strftime("%Y-%m-%d")
-
-    except:
-        return f"{month} {day}"
-
-
-def get_credit_card_summary(text):
-
-    """
-    Extract TD credit-card statement summary.
-
-    We use these figures for reconciliation instead of
-    trying to force bank-style debit/credit controls.
-    """
-
-    summary = {
-        "previous_balance": None,
-        "payments_credits": None,
-        "purchases_charges": None,
-        "interest": None,
-        "new_balance": None
-    }
-
-    patterns = {
-
-        "previous_balance": [
-            r"Previous\s+Balance\s+\$?\s*([\d,]+\.\d{2})"
-        ],
-
-        "payments_credits": [
-            r"Payments\s*(?:&|and)\s*Credits\s+"
-            r"\$?\s*([\d,]+\.\d{2})"
-        ],
-
-        "purchases_charges": [
-            r"Purchases\s*(?:&|and)\s*Other\s*Charges\s+"
-            r"\$?\s*([\d,]+\.\d{2})",
-
-            r"Purchases\s+and\s+Other\s+Charges\s+"
-            r"\$?\s*([\d,]+\.\d{2})"
-        ],
-
-        "interest": [
-            r"Interest\s+Charged\s+\$?\s*([\d,]+\.\d{2})",
-            r"Interest\s+\$?\s*([\d,]+\.\d{2})"
-        ],
-
-        "new_balance": [
-            r"New\s+Balance\s+\$?\s*([\d,]+\.\d{2})"
-        ]
-    }
-
-    for key, pattern_list in patterns.items():
-
-        for pattern in pattern_list:
-
-            match = re.search(
-                pattern,
-                text,
-                re.IGNORECASE
-            )
-
-            if match:
-
-                summary[key] = money_to_float(
-                    match.group(1)
-                )
-
-                break
-
-    return summary
-
-
-def get_credit_card_account_id(text):
-
-    """
-    Try to obtain the last four digits displayed
-    on the statement.
-    """
-
-    patterns = [
-        r"(?:Account|Card).*?(\d{4})\b",
-        r"\*{2,}\s*(\d{4})\b",
-        r"ending\s+in\s+(\d{4})"
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE
-        )
-
-        if match:
-            return match.group(1)
-
-    return "1674"
+    return df, controls
 
 
 # =========================================================
@@ -635,37 +370,91 @@ def extract_td_credit_card_transactions(pdf_bytes):
     for page in doc:
         full_text += page.get_text("text") + "\n"
 
-    statement_year = get_credit_card_year(
+    statement_year = extract_statement_year(
         full_text
     )
 
-    summary = get_credit_card_summary(
-        full_text
+    # =====================================================
+    # CREDIT CARD STATEMENT SUMMARY
+    # =====================================================
+
+    summary = {
+        "previous_balance": None,
+        "payments_credits": None,
+        "purchases_charges": None,
+        "cash_advances": None,
+        "interest": None,
+        "fees": None,
+        "new_balance": None
+    }
+
+    patterns = {
+
+        "previous_balance":
+            r"Previous Balance\s+\$([\d,]+\.\d{2})",
+
+        "payments_credits":
+            r"Payments\s*&\s*Credits\s+\$([\d,]+\.\d{2})",
+
+        "purchases_charges":
+            r"Purchases\s*&\s*Other Charges\s+\$([\d,]+\.\d{2})",
+
+        "cash_advances":
+            r"Cash Advances\s+\$([\d,]+\.\d{2})",
+
+        "interest":
+            r"Interest\s+\$([\d,]+\.\d{2})",
+
+        "fees":
+            r"Fees\s+\$([\d,]+\.\d{2})",
+
+        "new_balance":
+            r"NEW BALANCE\s+\$([\d,]+\.\d{2})"
+    }
+
+    for key, pattern in patterns.items():
+
+        match = re.search(
+            pattern,
+            full_text,
+            re.IGNORECASE
+        )
+
+        if match:
+
+            summary[key] = clean_amount(
+                match.group(1)
+            )
+
+    # =====================================================
+    # ACCOUNT NUMBER
+    # =====================================================
+
+    account_match = re.search(
+        r"Account Number:\s*"
+        r"(?:\d{4}\s+)?"
+        r"(?:\d{2}XX\s+XXXX\s+)?"
+        r"(\d{4})",
+        full_text,
+        re.IGNORECASE
     )
 
-    account_id = get_credit_card_account_id(
-        full_text
-    )
+    if account_match:
+        account_id = account_match.group(1)
+    else:
+        account_id = "0000"
+
+    # =====================================================
+    # TRANSACTIONS
+    # =====================================================
 
     transactions = []
 
-    # -----------------------------------------------------
-    # Credit-card transaction rows are handled separately
-    # from chequing.
-    #
-    # We use PyMuPDF line/block positioning rather than
-    # chequing debit/credit columns.
-    # -----------------------------------------------------
-
-    month_pattern = (
-        r"JAN|FEB|MAR|APR|MAY|JUN|JUL|"
-        r"AUG|SEP|OCT|NOV|DEC"
-    )
-
-    amount_pattern = re.compile(
-        r"^-?\$?[\d,]+\.\d{2}(?:CR)?$",
-        re.IGNORECASE
-    )
+    valid_months = {
+        "JAN", "FEB", "MAR", "APR",
+        "MAY", "JUN", "JUL", "AUG",
+        "SEP", "OCT", "NOV", "DEC"
+    }
 
     for page in doc:
 
@@ -674,264 +463,137 @@ def extract_td_credit_card_transactions(pdf_bytes):
         if not words:
             continue
 
-        # Group words by visual line
+        for date_word in words:
 
-        line_groups = {}
-
-        for word in words:
-
-            x0, y0, x1, y1, text, block, line, word_no = word
-
-            key = (
-                block,
-                line
+            x0, y0, x1, y1, month_text = (
+                date_word[:5]
             )
 
-            line_groups.setdefault(
-                key,
-                []
-            ).append(word)
-
-        ordered_lines = []
-
-        for key, line_words in line_groups.items():
-
-            line_words = sorted(
-                line_words,
-                key=lambda w: w[0]
+            month_text = (
+                month_text
+                .strip()
+                .upper()
             )
 
-            y_position = min(
-                w[1] for w in line_words
-            )
-
-            ordered_lines.append(
-                (
-                    y_position,
-                    line_words
-                )
-            )
-
-        ordered_lines.sort(
-            key=lambda item: item[0]
-        )
-
-        for _, line_words in ordered_lines:
-
-            texts = [
-                w[4].strip()
-                for w in line_words
-                if w[4].strip()
-            ]
-
-            if len(texts) < 3:
+            if month_text not in valid_months:
                 continue
 
-            line_text = " ".join(texts)
+            # TD transaction-date month position
 
-            upper_line = line_text.upper()
-
-            # Ignore headings and summary rows
-
-            skip_phrases = [
-                "TRANSACTION DATE",
-                "POSTING DATE",
-                "DESCRIPTION",
-                "AMOUNT",
-                "PREVIOUS BALANCE",
-                "NEW BALANCE",
-                "TOTAL",
-                "CREDIT LIMIT",
-                "AVAILABLE CREDIT",
-                "MINIMUM PAYMENT",
-                "PAYMENT DUE DATE"
-            ]
-
-            if any(
-                phrase in upper_line
-                for phrase in skip_phrases
-            ):
+            if not (40 <= x0 <= 60):
                 continue
 
-            # ---------------------------------------------
-            # Find first transaction date
-            # ---------------------------------------------
+            date_center_y = (
+                y0 + y1
+            ) / 2
 
-            transaction_month = None
-            transaction_day = None
-            date_end_index = None
+            row_words = []
 
-            # Formats can appear as:
-            # JUN 10
-            # JUN10
+            for word in words:
 
-            for i in range(len(texts)):
-
-                token = texts[i].upper()
-
-                combined_match = re.fullmatch(
-                    rf"({month_pattern})(\d{{1,2}})",
-                    token
+                wx0, wy0, wx1, wy1, text = (
+                    word[:5]
                 )
 
-                if combined_match:
+                word_center_y = (
+                    wy0 + wy1
+                ) / 2
 
-                    transaction_month = (
-                        combined_match.group(1)
-                    )
+                # TD's description baseline is slightly
+                # different from the transaction dates.
 
-                    transaction_day = int(
-                        combined_match.group(2)
-                    )
+                if abs(
+                    word_center_y
+                    -
+                    date_center_y
+                ) <= 3.5:
 
-                    date_end_index = i
+                    if wx0 < 360:
 
-                    break
-
-                if re.fullmatch(
-                    rf"({month_pattern})",
-                    token
-                ):
-
-                    if (
-                        i + 1 < len(texts)
-                        and
-                        re.fullmatch(
-                            r"\d{1,2}",
-                            texts[i + 1]
-                        )
-                    ):
-
-                        transaction_month = token
-
-                        transaction_day = int(
-                            texts[i + 1]
+                        row_words.append(
+                            word
                         )
 
-                        date_end_index = i + 1
-
-                        break
-
-            if transaction_month is None:
-                continue
-
-            # ---------------------------------------------
-            # Find amount at end of row
-            # ---------------------------------------------
-
-            amount_index = None
-            amount_text = None
-
-            for i in range(
-                len(texts) - 1,
-                -1,
-                -1
-            ):
-
-                candidate = (
-                    texts[i]
-                    .replace(" ", "")
-                )
-
-                if amount_pattern.fullmatch(
-                    candidate
-                ):
-
-                    amount_index = i
-                    amount_text = candidate
-
-                    break
-
-            if amount_index is None:
-                continue
-
-            # ---------------------------------------------
-            # Determine credit/payment versus charge
-            # ---------------------------------------------
-
-            is_credit = False
-
-            if amount_text.upper().endswith("CR"):
-
-                is_credit = True
-
-                amount_text = (
-                    amount_text[:-2]
-                )
-
-            amount = abs(
-                money_to_float(
-                    amount_text
-                )
+            row_words.sort(
+                key=lambda item: item[0]
             )
 
-            # Some PDF extraction places CR as separate word
+            # =================================================
+            # DAY
+            # =================================================
 
-            if (
-                amount_index + 1
-                < len(texts)
-                and
-                texts[amount_index + 1].upper()
-                == "CR"
-            ):
+            day = None
 
-                is_credit = True
+            for word in row_words:
 
-            # TD payment descriptions are also credits
-
-            # We only use this as a fallback if the PDF
-            # does not expose the CR marker.
-
-            description_zone = texts[
-                date_end_index + 1:
-                amount_index
-            ]
-
-            # Remove posting date if present.
-            # Usually the second date follows transaction date.
-
-            description_parts = []
-
-            i = 0
-
-            while i < len(description_zone):
-
-                token = description_zone[i]
-
-                # Skip second date in form JUN 11
+                wx0, wy0, wx1, wy1, text = (
+                    word[:5]
+                )
 
                 if (
-                    re.fullmatch(
-                        rf"({month_pattern})",
-                        token.upper()
-                    )
-                    and
-                    i + 1 < len(description_zone)
+                    55 <= wx0 <= 80
                     and
                     re.fullmatch(
                         r"\d{1,2}",
-                        description_zone[i + 1]
+                        text.strip()
                     )
                 ):
 
-                    i += 2
-                    continue
+                    day = int(
+                        text.strip()
+                    )
 
-                # Skip combined second date JUN11
+                    break
 
-                if re.fullmatch(
-                    rf"({month_pattern})\d{{1,2}}",
-                    token.upper()
-                ):
+            if day is None:
+                continue
 
-                    i += 1
-                    continue
+            # =================================================
+            # AMOUNT
+            # =================================================
 
-                description_parts.append(
-                    token
+            amount_text = None
+
+            for word in row_words:
+
+                wx0, wy0, wx1, wy1, text = (
+                    word[:5]
                 )
 
-                i += 1
+                cleaned = text.strip()
+
+                if (
+                    295 <= wx0 <= 355
+                    and
+                    re.fullmatch(
+                        r"-?\$[\d,]+\.\d{2}",
+                        cleaned
+                    )
+                ):
+
+                    amount_text = cleaned
+                    break
+
+            if amount_text is None:
+                continue
+
+            # =================================================
+            # DESCRIPTION
+            # =================================================
+
+            description_parts = []
+
+            for word in row_words:
+
+                wx0, wy0, wx1, wy1, text = (
+                    word[:5]
+                )
+
+                if 130 <= wx0 < 295:
+
+                    description_parts.append(
+                        text.strip()
+                    )
 
             description = " ".join(
                 description_parts
@@ -940,38 +602,51 @@ def extract_td_credit_card_transactions(pdf_bytes):
             if not description:
                 continue
 
-            upper_description = (
-                description.upper()
+            # =================================================
+            # DEBIT / CREDIT
+            # =================================================
+
+            numeric_amount = clean_amount(
+                amount_text
             )
-
-            if (
-                "PAYMENT" in upper_description
-                or
-                "THANK YOU" in upper_description
-            ):
-
-                is_credit = True
-
-            # ---------------------------------------------
-            # Debit / Credit representation for app
-            #
-            # Debit = purchase/charge
-            # Credit = payment/refund
-            # ---------------------------------------------
 
             debit = 0.0
             credit = 0.0
 
-            if is_credit:
-                credit = amount
-            else:
-                debit = amount
+            # For a credit card:
+            #
+            # Positive amount = purchase / charge
+            # Negative amount = payment / credit
 
-            transaction_date = parse_credit_card_date(
-                transaction_month,
-                transaction_day,
-                statement_year
-            )
+            if numeric_amount < 0:
+
+                credit = abs(
+                    numeric_amount
+                )
+
+            else:
+
+                debit = numeric_amount
+
+            # =================================================
+            # DATE
+            # =================================================
+
+            try:
+
+                transaction_date = (
+                    datetime.strptime(
+                        f"{month_text} {day} {statement_year}",
+                        "%b %d %Y"
+                    )
+                    .strftime("%Y-%m-%d")
+                )
+
+            except:
+
+                transaction_date = (
+                    f"{month_text} {day}"
+                )
 
             transactions.append({
                 "Date": transaction_date,
@@ -998,8 +673,6 @@ def extract_td_credit_card_transactions(pdf_bytes):
             errors="coerce"
         ).fillna(0)
 
-        # Remove exact duplicate extraction rows
-
         df = (
             df
             .drop_duplicates()
@@ -1008,192 +681,115 @@ def extract_td_credit_card_transactions(pdf_bytes):
 
     statement_info = {
         "summary": summary,
-        "account_id": account_id,
-        "statement_type": "credit_card"
+        "account_id": account_id
     }
 
     return df, statement_info
 
 
 # =========================================================
-# QUICKBOOKS ONLINE CSV
+# QUICKBOOKS CSV
 # =========================================================
 
-def generate_qbo_online_csv(
-    df,
-    statement_type
-):
+def create_quickbooks_csv(df):
 
-    export_df = df.copy()
-
-    if statement_type == "chequing":
-
-        # Bank:
-        # deposit = positive
-        # payment = negative
-
-        export_df["Amount"] = (
-            export_df["Credit"]
-            -
-            export_df["Debit"]
-        )
-
-    else:
-
-        # Credit card:
-        # purchase/charge = negative
-        # payment/refund = positive
-        #
-        # This mirrors TD's genuine credit-card QBO.
-
-        export_df["Amount"] = (
-            export_df["Credit"]
-            -
-            export_df["Debit"]
-        )
-
-    export_df = export_df[
-        [
-            "Date",
-            "Description",
-            "Amount"
-        ]
-    ].copy()
+    export_df = pd.DataFrame()
 
     export_df["Date"] = pd.to_datetime(
-        export_df["Date"]
-    ).dt.strftime("%m/%d/%Y")
+        df["Date"]
+    ).dt.strftime("%d/%m/%Y")
+
+    export_df["Description"] = df[
+        "Description"
+    ]
+
+    # Bank / credit card convention:
+    #
+    # Debit = money leaving bank or charge on card
+    # Credit = money entering bank or payment to card
+
+    export_df["Amount"] = (
+        df["Credit"]
+        -
+        df["Debit"]
+    )
 
     return export_df.to_csv(
         index=False
-    )
+    ).encode("utf-8")
 
 
 # =========================================================
-# TD CHEQUING DESKTOP QBO
+# QBO / WEB CONNECT FILE
 # =========================================================
 
-def generate_td_chequing_qbo(
+def create_qbo_file(
     df,
-    account_id,
-    ending_balance
+    account_type,
+    account_id="0000"
 ):
 
-    working_df = df.copy()
+    # QuickBooks OFX/QBO format
 
-    working_df["DateObject"] = pd.to_datetime(
-        working_df["Date"]
+    now = datetime.now().strftime(
+        "%Y%m%d%H%M%S"
     )
 
-    first_date = working_df[
-        "DateObject"
-    ].min()
+    if account_type == "Credit Card":
 
-    last_date = working_df[
-        "DateObject"
-    ].max()
+        acct_type_tag = ""
 
-    start_date = (
-        first_date.strftime("%Y%m%d")
-    )
+        account_section = f"""
+<CREDITCARDMSGSRSV1>
+<CCSTMTTRNRS>
+<TRNUID>1
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+</STATUS>
+<CCSTMTRS>
+<CURDEF>CAD
+<CCACCTFROM>
+<ACCTID>{account_id}
+</CCACCTFROM>
+"""
 
-    end_date = td_qbo_datetime(
-        last_date
-    )
+        closing_section = """
+</CCSTMTRS>
+</CCSTMTTRNRS>
+</CREDITCARDMSGSRSV1>
+"""
 
-    server_time = (
-        datetime.now()
-        .strftime("%Y%m%d%H%M%S")
-        + "[-5:EST]"
-    )
+    else:
 
-    blocks = []
+        account_section = f"""
+<BANKMSGSRSV1>
+<STMTTRNRS>
+<TRNUID>1
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+</STATUS>
+<STMTRS>
+<CURDEF>CAD
+<BANKACCTFROM>
+<BANKID>004
+<BRANCHID>00000
+<ACCTID>{account_id}
+<ACCTTYPE>CHECKING
+</BANKACCTFROM>
+"""
 
-    duplicate_counter = {}
+        closing_section = """
+</STMTRS>
+</STMTTRNRS>
+</BANKMSGSRSV1>
+"""
 
-    for _, row in working_df.iterrows():
-
-        debit = float(row["Debit"])
-        credit = float(row["Credit"])
-
-        amount = credit - debit
-
-        date_object = row["DateObject"]
-
-        date_text = (
-            date_object.strftime("%Y%m%d")
-        )
-
-        posted_date = td_qbo_datetime(
-            date_object
-        )
-
-        description = clean_qbo_text(
-            row["Description"]
-        )
-
-        transaction_type = (
-            "DEBIT"
-            if amount < 0
-            else "CREDIT"
-        )
-
-        duplicate_key = (
-            date_text,
-            description,
-            f"{amount:.2f}"
-        )
-
-        duplicate_counter[
-            duplicate_key
-        ] = (
-            duplicate_counter.get(
-                duplicate_key,
-                0
-            ) + 1
-        )
-
-        occurrence = duplicate_counter[
-            duplicate_key
-        ]
-
-        fitid = create_fitid(
-            "TD-BANK",
-            date_text,
-            description,
-            amount,
-            occurrence
-        )
-
-        blocks.append(
-            "<STMTTRN>\n"
-            f"<TRNTYPE>{transaction_type}\n"
-            f"<DTPOSTED>{posted_date}\n"
-            f"<TRNAMT>{amount:.2f}\n"
-            f"<FITID>{fitid}\n"
-            f"<NAME>{description}\n"
-            "</STMTTRN>"
-        )
-
-    transactions_text = "\n".join(
-        blocks
-    )
-
-    if ending_balance is None:
-        ending_balance = 0.00
-
-    trnuid = (
-        "QWEB - "
-        + datetime.now().strftime(
-            "%Y%m%d%H%M%S"
-        )
-        + "0191"
-    )
-
-    return f"""OFXHEADER:100
+    qbo = """OFXHEADER:100
 DATA:OFXSGML
 VERSION:102
-SECURITY:TYPE1
+SECURITY:NONE
 ENCODING:USASCII
 CHARSET:1252
 COMPRESSION:NONE
@@ -1206,88 +802,59 @@ NEWFILEUID:NONE
 <STATUS>
 <CODE>0
 <SEVERITY>INFO
-<MESSAGE>OK
 </STATUS>
-<DTSERVER>{server_time}
-<USERKEY>--NoUserKey--
+<DTSERVER>""" + now + """
 <LANGUAGE>ENG
-<INTU.BID>00002
+<FI>
+<ORG>TD Canada Trust
+<FID>004
+</FI>
 </SONRS>
 </SIGNONMSGSRSV1>
-<BANKMSGSRSV1>
-<STMTTRNRS>
-<TRNUID>{trnuid}
-<STATUS>
-<CODE>0
-<SEVERITY>INFO
-<MESSAGE>OK
-</STATUS>
-<STMTRS>
-<CURDEF>CAD
-<BANKACCTFROM>
-<BANKID>300000100
-<ACCTID>{account_id}
-<ACCTTYPE>CHECKING
-</BANKACCTFROM>
-<BANKTRANLIST>
-<DTSTART>{start_date}
-<DTEND>{end_date}
-{transactions_text}
-</BANKTRANLIST>
-<LEDGERBAL>
-<BALAMT>{ending_balance:.2f}
-<DTASOF>{end_date}
-</LEDGERBAL>
-</STMTRS>
-</STMTTRNRS>
-</BANKMSGSRSV1>
-</OFX>
 """
 
+    qbo += account_section
 
-# =========================================================
-# TD CREDIT CARD DESKTOP QBO
-# =========================================================
+    qbo += """
+<BANKTRANLIST>
+"""
 
-def generate_td_credit_card_qbo(
-    df,
-    account_id,
-    new_balance
-):
+    if not df.empty:
 
-    working_df = df.copy()
+        start_date = (
+            pd.to_datetime(
+                df["Date"]
+            )
+            .min()
+            .strftime("%Y%m%d")
+        )
 
-    working_df["DateObject"] = pd.to_datetime(
-        working_df["Date"]
+        end_date = (
+            pd.to_datetime(
+                df["Date"]
+            )
+            .max()
+            .strftime("%Y%m%d")
+        )
+
+    else:
+
+        start_date = now[:8]
+        end_date = now[:8]
+
+    qbo += (
+        f"<DTSTART>{start_date}\n"
+        f"<DTEND>{end_date}\n"
     )
 
-    first_date = working_df[
-        "DateObject"
-    ].min()
+    for index, row in df.iterrows():
 
-    last_date = working_df[
-        "DateObject"
-    ].max()
-
-    start_date = (
-        first_date.strftime("%Y%m%d")
-    )
-
-    end_date = td_qbo_datetime(
-        last_date
-    )
-
-    server_time = (
-        datetime.now()
-        .strftime("%Y%m%d%H%M%S")
-        + "[-5:EST]"
-    )
-
-    blocks = []
-
-    duplicate_counter = {}
-
-    for _, row in working_df.iterrows():
+        date_value = (
+            pd.to_datetime(
+                row["Date"]
+            )
+            .strftime("%Y%m%d")
+        )
 
         debit = float(
             row["Debit"]
@@ -1297,154 +864,83 @@ def generate_td_credit_card_qbo(
             row["Credit"]
         )
 
-        # TD genuine credit-card QBO:
-        #
-        # purchase = negative
-        # payment/refund = positive
+        # QuickBooks:
+        # money out / card purchase = negative
+        # money in / card payment = positive
 
         amount = credit - debit
 
-        date_object = row[
-            "DateObject"
-        ]
+        if amount < 0:
 
-        date_text = (
-            date_object.strftime(
-                "%Y%m%d"
-            )
-        )
+            if account_type == "Credit Card":
+                trn_type = "DEBIT"
+            else:
+                trn_type = "DEBIT"
 
-        posted_date = td_qbo_datetime(
-            date_object
-        )
+        else:
 
-        description = clean_qbo_text(
+            if account_type == "Credit Card":
+                trn_type = "CREDIT"
+            else:
+                trn_type = "CREDIT"
+
+        description = str(
             row["Description"]
         )
 
-        transaction_type = (
-            "DEBIT"
-            if amount < 0
-            else "CREDIT"
+        # Avoid OFX-breaking characters
+
+        description = (
+            description
+            .replace("&", "and")
+            .replace("<", "")
+            .replace(">", "")
         )
 
-        duplicate_key = (
-            date_text,
-            description,
-            f"{amount:.2f}"
+        fitid = (
+            f"{date_value}"
+            f"{index + 1:05d}"
+            f"{abs(int(round(amount * 100)))}"
         )
 
-        duplicate_counter[
-            duplicate_key
-        ] = (
-            duplicate_counter.get(
-                duplicate_key,
-                0
-            ) + 1
-        )
+        qbo += f"""
+<STMTTRN>
+<TRNTYPE>{trn_type}
+<DTPOSTED>{date_value}
+<TRNAMT>{amount:.2f}
+<FITID>{fitid}
+<NAME>{description[:32]}
+<MEMO>{description[:255]}
+</STMTTRN>
+"""
 
-        occurrence = duplicate_counter[
-            duplicate_key
-        ]
-
-        fitid = create_fitid(
-            "TD-CC",
-            date_text,
-            description,
-            amount,
-            occurrence
-        )
-
-        blocks.append(
-            "<STMTTRN>\n"
-            f"<TRNTYPE>{transaction_type}\n"
-            f"<DTPOSTED>{posted_date}\n"
-            f"<TRNAMT>{amount:.2f}\n"
-            f"<FITID>{fitid}\n"
-            f"<NAME>{description}\n"
-            "</STMTTRN>"
-        )
-
-    transactions_text = "\n".join(
-        blocks
-    )
-
-    # Credit-card liability balance must be negative
-    # in TD's genuine QBO representation.
-
-    if new_balance is None:
-        ledger_balance = 0.00
-    else:
-        ledger_balance = -abs(
-            float(new_balance)
-        )
-
-    trnuid = (
-        "QWEB - "
-        + datetime.now().strftime(
-            "%Y%m%d%H%M%S"
-        )
-        + "0191"
-    )
-
-    # TD credit-card Web Connect uses
-    # CREDITCARDMSGSRSV1 / CCSTMTRS / CCACCTFROM.
-
-    return f"""OFXHEADER:100
-DATA:OFXSGML
-VERSION:102
-SECURITY:TYPE1
-ENCODING:USASCII
-CHARSET:1252
-COMPRESSION:NONE
-OLDFILEUID:NONE
-NEWFILEUID:NONE
-
-<OFX>
-<SIGNONMSGSRSV1>
-<SONRS>
-<STATUS>
-<CODE>0
-<SEVERITY>INFO
-<MESSAGE>OK
-</STATUS>
-<DTSERVER>{server_time}
-<USERKEY>--NoUserKey--
-<LANGUAGE>ENG
-<INTU.BID>00002
-</SONRS>
-</SIGNONMSGSRSV1>
-<CREDITCARDMSGSRSV1>
-<CCSTMTTRNRS>
-<TRNUID>{trnuid}
-<STATUS>
-<CODE>0
-<SEVERITY>INFO
-<MESSAGE>OK
-</STATUS>
-<CCSTMTRS>
-<CURDEF>CAD
-<CCACCTFROM>
-<ACCTID>{account_id}
-</CCACCTFROM>
-<BANKTRANLIST>
-<DTSTART>{start_date}
-<DTEND>{end_date}
-{transactions_text}
+    qbo += """
 </BANKTRANLIST>
+"""
+
+    # Required balance block
+
+    qbo += f"""
 <LEDGERBAL>
-<BALAMT>{ledger_balance:.2f}
+<BALAMT>0.00
 <DTASOF>{end_date}
 </LEDGERBAL>
-</CCSTMTRS>
-</CCSTMTTRNRS>
-</CREDITCARDMSGSRSV1>
+"""
+
+    qbo += closing_section
+
+    qbo += """
 </OFX>
 """
 
+    return qbo.encode(
+        "cp1252",
+        errors="replace"
+    )
+
 
 # =========================================================
-# USER CONTROLS
+# USER INTERFACE
 # =========================================================
 
 col1, col2 = st.columns(2)
@@ -1454,28 +950,20 @@ with col1:
     bank = st.selectbox(
         "Bank",
         [
-            "Select Bank",
             "TD Canada Trust"
         ]
     )
-
 
 with col2:
 
     account_type = st.selectbox(
         "Account Type",
         [
-            "Business Chequing",
-            "Personal Chequing",
-            "Savings",
+            "Chequing",
             "Credit Card"
         ]
     )
 
-
-# =========================================================
-# FILE UPLOAD
-# =========================================================
 
 uploaded_file = st.file_uploader(
     "Upload Bank PDF Statement",
@@ -1489,67 +977,76 @@ if uploaded_file is not None:
         f"Uploaded: {uploaded_file.name}"
     )
 
-    if bank != "TD Canada Trust":
 
-        st.warning(
-            "Please select TD Canada Trust."
-        )
+process_button = st.button(
+    "Process Statement",
+    type="primary"
+)
 
-    elif account_type in [
-        "Personal Chequing",
-        "Savings"
-    ]:
 
-        st.warning(
-            "This account type has not yet been configured."
-        )
+# =========================================================
+# PROCESS
+# =========================================================
 
-    else:
+if (
+    process_button
+    and
+    uploaded_file is not None
+):
 
-        if st.button(
-            "Process Statement",
-            type="primary"
-        ):
+    pdf_bytes = uploaded_file.getvalue()
 
-            pdf_bytes = (
-                uploaded_file.getvalue()
+    try:
+
+        # =================================================
+        # CHEQUING
+        # =================================================
+
+        if account_type == "Chequing":
+
+            df, controls = (
+                extract_td_chequing_transactions(
+                    pdf_bytes
+                )
             )
 
-            try:
+            statement_info = {
+                "account_id": "0000"
+            }
 
-                if account_type == "Credit Card":
+        # =================================================
+        # CREDIT CARD
+        # =================================================
 
-                    df, statement_info = (
-                        extract_td_credit_card_transactions(
-                            pdf_bytes
-                        )
-                    )
+        else:
 
-                else:
-
-                    df, statement_info = (
-                        extract_td_chequing_transactions(
-                            pdf_bytes
-                        )
-                    )
-
-                st.session_state[
-                    "transactions"
-                ] = df
-
-                st.session_state[
-                    "statement_info"
-                ] = statement_info
-
-                st.session_state[
-                    "processed_account_type"
-                ] = account_type
-
-            except Exception as e:
-
-                st.error(
-                    f"Unable to process statement: {e}"
+            df, statement_info = (
+                extract_td_credit_card_transactions(
+                    pdf_bytes
                 )
+            )
+
+            controls = None
+
+        # =================================================
+        # STORE RESULTS
+        # =================================================
+
+        st.session_state["transactions"] = df
+        st.session_state["controls"] = controls
+        st.session_state[
+            "statement_info"
+        ] = statement_info
+
+        st.session_state[
+            "processed_account_type"
+        ] = account_type
+
+    except Exception as e:
+
+        st.error(
+            f"Error processing statement: {e}"
+        )
 
 
 # =========================================================
@@ -1562,20 +1059,16 @@ if "transactions" in st.session_state:
         "transactions"
     ]
 
-    statement_info = st.session_state[
-        "statement_info"
-    ]
-
     processed_account_type = (
         st.session_state.get(
             "processed_account_type",
-            ""
+            account_type
         )
     )
 
     st.divider()
 
-    st.subheader(
+    st.header(
         "Transaction Review"
     )
 
@@ -1587,177 +1080,160 @@ if "transactions" in st.session_state:
 
     else:
 
-        edited_df = st.data_editor(
-            df,
+        # =================================================
+        # DISPLAY TABLE
+        # =================================================
+
+        display_df = df.copy()
+
+        st.dataframe(
+            display_df,
             use_container_width=True,
             hide_index=True,
-            num_rows="dynamic",
             column_config={
-
-                "Date":
-                    st.column_config.TextColumn(
-                        "Date"
-                    ),
-
-                "Description":
-                    st.column_config.TextColumn(
-                        "Description"
-                    ),
-
-                "Debit":
-                    st.column_config.NumberColumn(
-                        "Debit",
-                        format="$%.2f"
-                    ),
-
-                "Credit":
-                    st.column_config.NumberColumn(
-                        "Credit",
-                        format="$%.2f"
-                    )
+                "Debit": st.column_config.NumberColumn(
+                    "Debit",
+                    format="$%.2f"
+                ),
+                "Credit": st.column_config.NumberColumn(
+                    "Credit",
+                    format="$%.2f"
+                )
             }
-        )
-
-        debit_total = float(
-            edited_df["Debit"].sum()
-        )
-
-        credit_total = float(
-            edited_df["Credit"].sum()
-        )
-
-        debit_count = int(
-            (
-                edited_df["Debit"] > 0
-            ).sum()
-        )
-
-        credit_count = int(
-            (
-                edited_df["Credit"] > 0
-            ).sum()
-        )
-
-        transaction_count = len(
-            edited_df
         )
 
         st.divider()
 
-        st.subheader(
+        st.header(
             "Statement Control"
         )
 
-        reconciled = False
+        transaction_count = len(
+            df
+        )
 
+        total_debits = round(
+            df["Debit"].sum(),
+            2
+        )
+
+        total_credits = round(
+            df["Credit"].sum(),
+            2
+        )
+
+        debit_count = int(
+            (df["Debit"] > 0).sum()
+        )
+
+        credit_count = int(
+            (df["Credit"] > 0).sum()
+        )
+
+        metric1, metric2, metric3 = (
+            st.columns(3)
+        )
+
+        metric1.metric(
+            "Transactions",
+            transaction_count
+        )
+
+        metric2.metric(
+            "Total Debits",
+            f"${total_debits:,.2f}"
+        )
+
+        metric3.metric(
+            "Total Credits",
+            f"${total_credits:,.2f}"
+        )
+
+        st.write(
+            f"Extracted Debits: "
+            f"{debit_count} transactions"
+        )
+
+        st.write(
+            f"Extracted Credits: "
+            f"{credit_count} transactions"
+        )
+
+        st.divider()
 
         # =================================================
         # CHEQUING RECONCILIATION
         # =================================================
 
-        if (
-            statement_info[
-                "statement_type"
-            ]
-            == "chequing"
-        ):
+        if processed_account_type == "Chequing":
 
-            control = statement_info[
-                "control"
-            ]
-
-            ending_balance = (
-                statement_info[
-                    "ending_balance"
-                ]
+            controls = st.session_state.get(
+                "controls"
             )
 
-            col1, col2, col3 = (
-                st.columns(3)
-            )
+            if controls:
 
-            col1.metric(
-                "Transactions",
-                transaction_count
-            )
-
-            col2.metric(
-                "Total Debits",
-                f"${debit_total:,.2f}"
-            )
-
-            col3.metric(
-                "Total Credits",
-                f"${credit_total:,.2f}"
-            )
-
-            st.write(
-                f"Extracted Debits: "
-                f"{debit_count} transactions"
-            )
-
-            st.write(
-                f"Extracted Credits: "
-                f"{credit_count} transactions"
-            )
-
-            if ending_balance is not None:
-
-                if ending_balance < 0:
-
-                    st.write(
-                        "Ending Balance: "
-                        f"${abs(ending_balance):,.2f} OD"
-                    )
-
-                else:
-
-                    st.write(
-                        "Ending Balance: "
-                        f"${ending_balance:,.2f}"
-                    )
-
-            if (
-                control["debit_total"]
-                is not None
-                and
-                control["credit_total"]
-                is not None
-            ):
-
-                st.divider()
-
-                st.write(
-                    f"TD Statement Debits: "
-                    f"{control['debit_count']} transactions, "
-                    f"${control['debit_total']:,.2f}"
+                td_debit_count = controls.get(
+                    "debit_count"
                 )
 
-                st.write(
-                    f"TD Statement Credits: "
-                    f"{control['credit_count']} transactions, "
-                    f"${control['credit_total']:,.2f}"
+                td_debit_total = controls.get(
+                    "debit_total"
                 )
 
-                reconciled = (
-                    debit_count
-                    == control["debit_count"]
+                td_credit_count = controls.get(
+                    "credit_count"
+                )
+
+                td_credit_total = controls.get(
+                    "credit_total"
+                )
+
+                if (
+                    td_debit_count is not None
                     and
-                    credit_count
-                    == control["credit_count"]
+                    td_debit_total is not None
+                ):
+
+                    st.write(
+                        f"TD Statement Debits: "
+                        f"{td_debit_count} transactions, "
+                        f"${td_debit_total:,.2f}"
+                    )
+
+                if (
+                    td_credit_count is not None
+                    and
+                    td_credit_total is not None
+                ):
+
+                    st.write(
+                        f"TD Statement Credits: "
+                        f"{td_credit_count} transactions, "
+                        f"${td_credit_total:,.2f}"
+                    )
+
+                debit_ok = (
+                    td_debit_count == debit_count
                     and
                     abs(
-                        debit_total
-                        - control["debit_total"]
-                    ) < 0.01
-                    and
-                    abs(
-                        credit_total
-                        - control["credit_total"]
+                        td_debit_total
+                        -
+                        total_debits
                     ) < 0.01
                 )
 
-                if reconciled:
+                credit_ok = (
+                    td_credit_count == credit_count
+                    and
+                    abs(
+                        td_credit_total
+                        -
+                        total_credits
+                    ) < 0.01
+                )
+
+                if debit_ok and credit_ok:
 
                     st.success(
                         "✓ STATEMENT RECONCILES"
@@ -1766,9 +1242,8 @@ if "transactions" in st.session_state:
                 else:
 
                     st.error(
-                        "⚠ STATEMENT DOES NOT RECONCILE"
+                        "STATEMENT DOES NOT RECONCILE"
                     )
-
 
         # =================================================
         # CREDIT CARD RECONCILIATION
@@ -1776,313 +1251,192 @@ if "transactions" in st.session_state:
 
         else:
 
-            summary = statement_info[
-                "summary"
-            ]
-
-            col1, col2, col3 = (
-                st.columns(3)
-            )
-
-            col1.metric(
-                "Transactions",
-                transaction_count
-            )
-
-            col2.metric(
-                "Charges",
-                f"${debit_total:,.2f}"
-            )
-
-            col3.metric(
-                "Payments / Credits",
-                f"${credit_total:,.2f}"
-            )
-
-            st.write(
-                f"Extracted Charges: "
-                f"{debit_count} transactions"
-            )
-
-            st.write(
-                f"Extracted Payments / Credits: "
-                f"{credit_count} transactions"
-            )
-
-            st.divider()
-
-            if (
-                summary["previous_balance"]
-                is not None
-            ):
-
-                st.write(
-                    "TD Previous Balance: "
-                    f"${summary['previous_balance']:,.2f}"
+            statement_info = (
+                st.session_state.get(
+                    "statement_info",
+                    {}
                 )
+            )
 
-            if (
-                summary["payments_credits"]
-                is not None
-            ):
+            summary = statement_info.get(
+                "summary",
+                {}
+            )
 
-                st.write(
-                    "TD Payments & Credits: "
-                    f"${summary['payments_credits']:,.2f}"
-                )
+            purchases = summary.get(
+                "purchases_charges"
+            )
 
-            if (
-                summary["purchases_charges"]
-                is not None
-            ):
+            interest = summary.get(
+                "interest"
+            )
+
+            fees = summary.get(
+                "fees"
+            )
+
+            payments = summary.get(
+                "payments_credits"
+            )
+
+            new_balance = summary.get(
+                "new_balance"
+            )
+
+            if purchases is not None:
 
                 st.write(
                     "TD Purchases & Other Charges: "
-                    f"${summary['purchases_charges']:,.2f}"
+                    f"${purchases:,.2f}"
                 )
 
-            if summary["interest"] is not None:
+            if interest is not None:
 
                 st.write(
                     "TD Interest: "
-                    f"${summary['interest']:,.2f}"
+                    f"${interest:,.2f}"
                 )
 
-            if (
-                summary["new_balance"]
-                is not None
-            ):
+            if fees is not None:
+
+                st.write(
+                    "TD Fees: "
+                    f"${fees:,.2f}"
+                )
+
+            if payments is not None:
+
+                st.write(
+                    "TD Payments & Credits: "
+                    f"${payments:,.2f}"
+                )
+
+            if new_balance is not None:
 
                 st.write(
                     "TD New Balance: "
-                    f"${summary['new_balance']:,.2f}"
+                    f"${new_balance:,.2f}"
                 )
 
-            # ---------------------------------------------
-            # Reconcile using statement equation
-            #
-            # Previous Balance
-            # - Payments/Credits
-            # + Charges
-            # + Interest
-            # = New Balance
-            # ---------------------------------------------
+            expected_charges = (
+                (purchases or 0)
+                +
+                (interest or 0)
+                +
+                (fees or 0)
+            )
 
-            required_summary = [
-                summary["previous_balance"],
-                summary["payments_credits"],
-                summary["purchases_charges"],
-                summary["new_balance"]
-            ]
-
-            if all(
-                value is not None
-                for value in required_summary
-            ):
-
-                interest = (
-                    summary["interest"]
-                    if summary["interest"]
-                    is not None
-                    else 0.0
-                )
-
-                calculated_balance = (
-                    summary["previous_balance"]
+            charges_ok = (
+                abs(
+                    expected_charges
                     -
-                    summary["payments_credits"]
-                    +
-                    summary["purchases_charges"]
-                    +
-                    interest
+                    total_debits
                 )
+                < 0.01
+            )
 
-                statement_equation_matches = (
-                    abs(
-                        calculated_balance
-                        -
-                        summary["new_balance"]
-                    )
-                    < 0.01
+            payments_ok = (
+                payments is not None
+                and
+                abs(
+                    payments
+                    -
+                    total_credits
                 )
+                < 0.01
+            )
 
-                # Extracted transactions should equal:
-                #
-                # payments/credits
-                # and
-                # purchases + interest
+            if charges_ok and payments_ok:
 
-                expected_charges = (
-                    summary["purchases_charges"]
-                    +
-                    interest
+                st.success(
+                    "✓ CREDIT CARD STATEMENT RECONCILES"
                 )
-
-                extracted_charges_match = (
-                    abs(
-                        debit_total
-                        -
-                        expected_charges
-                    )
-                    < 0.01
-                )
-
-                extracted_credits_match = (
-                    abs(
-                        credit_total
-                        -
-                        summary[
-                            "payments_credits"
-                        ]
-                    )
-                    < 0.01
-                )
-
-                reconciled = (
-                    statement_equation_matches
-                    and
-                    extracted_charges_match
-                    and
-                    extracted_credits_match
-                )
-
-                if reconciled:
-
-                    st.success(
-                        "✓ CREDIT CARD STATEMENT RECONCILES"
-                    )
-
-                else:
-
-                    st.error(
-                        "⚠ CREDIT CARD STATEMENT "
-                        "DOES NOT RECONCILE"
-                    )
-
-                    st.write(
-                        "Extracted charges difference: "
-                        f"${debit_total - expected_charges:,.2f}"
-                    )
-
-                    st.write(
-                        "Extracted payments/credits difference: "
-                        f"${credit_total - summary['payments_credits']:,.2f}"
-                    )
 
             else:
 
-                st.warning(
-                    "Unable to read all credit-card "
-                    "statement control totals."
+                st.error(
+                    "CREDIT CARD STATEMENT "
+                    "DOES NOT RECONCILE"
                 )
 
+                st.write(
+                    "Expected Charges: "
+                    f"${expected_charges:,.2f}"
+                )
+
+                st.write(
+                    "Extracted Charges: "
+                    f"${total_debits:,.2f}"
+                )
+
+                if payments is not None:
+
+                    st.write(
+                        "Expected Payments/Credits: "
+                        f"${payments:,.2f}"
+                    )
+
+                    st.write(
+                        "Extracted Payments/Credits: "
+                        f"${total_credits:,.2f}"
+                    )
 
         # =================================================
-        # DOWNLOADS
+        # DOWNLOAD FILES
         # =================================================
 
         st.divider()
 
         st.subheader(
-            "QuickBooks Downloads"
+            "Download QuickBooks Files"
         )
 
-        if reconciled:
+        csv_file = create_quickbooks_csv(
+            df
+        )
 
-            st.success(
-                "Statement verified. "
-                "Choose your QuickBooks format."
+        statement_info = (
+            st.session_state.get(
+                "statement_info",
+                {}
+            )
+        )
+
+        account_id = statement_info.get(
+            "account_id",
+            "0000"
+        )
+
+        qbo_file = create_qbo_file(
+            df,
+            processed_account_type,
+            account_id
+        )
+
+        download1, download2 = (
+            st.columns(2)
+        )
+
+        with download1:
+
+            st.download_button(
+                label="Download QuickBooks CSV",
+                data=csv_file,
+                file_name=(
+                    "quickbooks_transactions.csv"
+                ),
+                mime="text/csv"
             )
 
-            statement_type = (
-                statement_info[
-                    "statement_type"
-                ]
-            )
+        with download2:
 
-            csv_data = (
-                generate_qbo_online_csv(
-                    edited_df,
-                    statement_type
-                )
-            )
-
-            if (
-                statement_type
-                == "chequing"
-            ):
-
-                qbo_data = (
-                    generate_td_chequing_qbo(
-                        edited_df,
-                        statement_info[
-                            "account_id"
-                        ],
-                        statement_info[
-                            "ending_balance"
-                        ]
-                    )
-                )
-
-            else:
-
-                qbo_data = (
-                    generate_td_credit_card_qbo(
-                        edited_df,
-                        statement_info[
-                            "account_id"
-                        ],
-                        statement_info[
-                            "summary"
-                        ][
-                            "new_balance"
-                        ]
-                    )
-                )
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-
-                st.write(
-                    "QuickBooks Online"
-                )
-
-                st.download_button(
-                    label=(
-                        "Download QuickBooks Online CSV"
-                    ),
-                    data=csv_data,
-                    file_name=(
-                        "quickbooks_online.csv"
-                    ),
-                    mime="text/csv",
-                    use_container_width=True
-                )
-
-            with col2:
-
-                st.write(
-                    "QuickBooks Desktop"
-                )
-
-                st.download_button(
-                    label=(
-                        "Download QuickBooks Desktop QBO"
-                    ),
-                    data=qbo_data,
-                    file_name=(
-                        "quickbooks_desktop.qbo"
-                    ),
-                    mime="application/x-ofx",
-                    use_container_width=True
-                )
-
-        else:
-
-            st.warning(
-                "Downloads are disabled because "
-                "the statement does not reconcile."
+            st.download_button(
+                label="Download QuickBooks QBO",
+                data=qbo_file,
+                file_name=(
+                    "quickbooks_webconnect.qbo"
+                ),
+                mime="application/octet-stream"
             )
 
 
