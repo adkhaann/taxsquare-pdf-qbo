@@ -1188,82 +1188,45 @@ def generate_td_credit_card_qbo(
     account_id,
     new_balance
 ):
+    """
+    Generate a QuickBooks Desktop Web Connect (.QBO) file
+    for a TD Canada Trust credit-card statement.
+
+    Key points:
+    - Credit-card OFX wrapper: CREDITCARDMSGSRSV1 / CCSTMTRS
+    - Charges are negative; payments/credits are positive
+    - Uses TD Canada Trust's Intuit branding ID in addition to FI/FID
+    - Adds OFX date timezone suffixes expected by QuickBooks Web Connect
+    """
 
     working_df = df.copy()
+    working_df["DateObject"] = pd.to_datetime(working_df["Date"])
 
-    working_df["DateObject"] = (
-        pd.to_datetime(
-            working_df["Date"]
-        )
-    )
+    first_date = working_df["DateObject"].min()
+    last_date = working_df["DateObject"].max()
 
-    first_date = (
-        working_df["DateObject"]
-        .min()
-    )
+    def ofx_dt(value):
+        return value.strftime("%Y%m%d") + "120000[0:GMT]"
 
-    last_date = (
-        working_df["DateObject"]
-        .max()
-    )
-
-    start_date = (
-        qbo_datetime(
-            first_date
-        )
-    )
-
-    end_date = (
-        qbo_datetime(
-            last_date
-        )
-    )
-
-    server_time = (
-        datetime.now()
-        .strftime(
-            "%Y%m%d%H%M%S"
-        )
-    )
+    start_date = ofx_dt(first_date)
+    end_date = ofx_dt(last_date)
+    server_time = datetime.now().strftime("%Y%m%d%H%M%S") + "[0:GMT]"
 
     transaction_blocks = []
-
     duplicate_counter = {}
 
     for _, row in working_df.iterrows():
+        debit = float(row["Debit"])
+        credit = float(row["Credit"])
 
-        debit = float(
-            row["Debit"]
-        )
-
-        credit = float(
-            row["Credit"]
-        )
-
-        # -------------------------------------------------
         # Credit-card OFX convention:
-        #
-        # Purchase/charge = negative
-        # Payment/refund = positive
-        # -------------------------------------------------
+        # purchase/charge = negative
+        # payment/refund = positive
+        amount = credit - debit
 
-        amount = (
-            credit - debit
-        )
-
-        date_object = (
-            row["DateObject"]
-        )
-
-        date_text = (
-            date_object.strftime(
-                "%Y%m%d"
-            )
-        )
-
-        description = clean_qbo_text(
-            row["Description"]
-        )
+        date_object = row["DateObject"]
+        date_text = date_object.strftime("%Y%m%d")
+        description = clean_qbo_text(row["Description"])
 
         duplicate_key = (
             date_text,
@@ -1271,14 +1234,8 @@ def generate_td_credit_card_qbo(
             f"{amount:.2f}"
         )
 
-        duplicate_counter[
-            duplicate_key
-        ] = (
-            duplicate_counter.get(
-                duplicate_key,
-                0
-            )
-            + 1
+        duplicate_counter[duplicate_key] = (
+            duplicate_counter.get(duplicate_key, 0) + 1
         )
 
         fitid = create_fitid(
@@ -1286,23 +1243,15 @@ def generate_td_credit_card_qbo(
             date_text,
             description,
             amount,
-            duplicate_counter[
-                duplicate_key
-            ]
+            duplicate_counter[duplicate_key]
         )
 
-        if amount < 0:
+        trntype = "DEBIT" if amount < 0 else "CREDIT"
 
-            trntype = "DEBIT"
-
-        else:
-
-            trntype = "CREDIT"
-
-        block = (
+        transaction_blocks.append(
             "<STMTTRN>\n"
             f"<TRNTYPE>{trntype}\n"
-            f"<DTPOSTED>{qbo_datetime(date_object)}\n"
+            f"<DTPOSTED>{ofx_dt(date_object)}\n"
             f"<TRNAMT>{amount:.2f}\n"
             f"<FITID>{fitid}\n"
             f"<NAME>{description[:32]}\n"
@@ -1310,34 +1259,21 @@ def generate_td_credit_card_qbo(
             "</STMTTRN>"
         )
 
-        transaction_blocks.append(
-            block
-        )
+    transactions_text = "\n".join(transaction_blocks)
 
-    transactions_text = "\n".join(
-        transaction_blocks
+    # Credit-card liability balance is negative in OFX.
+    ledger_balance = (
+        0.00
+        if new_balance is None
+        else -abs(float(new_balance))
     )
 
-    # -----------------------------------------------------
-    # For a credit-card liability, the amount owed is
-    # represented as a negative OFX ledger balance.
-    # -----------------------------------------------------
-
-    if new_balance is None:
-
-        ledger_balance = 0.00
-
-    else:
-
-        ledger_balance = (
-            -abs(
-                float(new_balance)
-            )
-        )
-
-    # -----------------------------------------------------
-    # CREDIT CARD QBO
-    # -----------------------------------------------------
+    # TD Canada Trust Web Connect branding.
+    # INTU.BID is intentionally included because QuickBooks validates
+    # Web Connect files against its Financial Institutions Directory.
+    td_org = "TD Canada Trust"
+    td_fid = "004"
+    td_intu_bid = "0002"
 
     qbo = f"""OFXHEADER:100
 DATA:OFXSGML
@@ -1359,9 +1295,10 @@ NEWFILEUID:NONE
 <DTSERVER>{server_time}
 <LANGUAGE>ENG
 <FI>
-<ORG>TD Canada Trust
-<FID>004
+<ORG>{td_org}
+<FID>{td_fid}
 </FI>
+<INTU.BID>{td_intu_bid}
 </SONRS>
 </SIGNONMSGSRSV1>
 <CREDITCARDMSGSRSV1>
@@ -1370,6 +1307,7 @@ NEWFILEUID:NONE
 <STATUS>
 <CODE>0
 <SEVERITY>INFO
+<MESSAGE>Success
 </STATUS>
 <CCSTMTRS>
 <CURDEF>CAD
