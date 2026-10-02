@@ -27,7 +27,7 @@ st.divider()
 
 
 # =========================================================
-# GENERAL HELPER FUNCTIONS
+# GENERAL HELPERS
 # =========================================================
 
 def money_to_float(value):
@@ -53,7 +53,6 @@ def parse_td_date(date_text, statement_year):
     date_text = date_text.strip().upper()
 
     try:
-
         parsed = datetime.strptime(
             f"{date_text}{statement_year}",
             "%b%d%Y"
@@ -79,6 +78,10 @@ def get_statement_year(text):
 
     return datetime.now().year
 
+
+# =========================================================
+# STATEMENT CONTROL TOTALS
+# =========================================================
 
 def get_statement_control_totals(text):
 
@@ -129,6 +132,90 @@ def get_statement_control_totals(text):
 
 
 # =========================================================
+# TD ENDING BALANCE
+# =========================================================
+
+def get_td_ending_balance(text):
+
+    """
+    Reads the final balance from the TD transaction section.
+
+    Example:
+    OVERDRAFT INTEREST 174.16 MAY29 42,247.74OD
+
+    TD prints OD after an overdrawn balance.
+    Therefore:
+    42,247.74OD = -42247.74
+    """
+
+    lines = text.splitlines()
+
+    balance_candidates = []
+
+    for line in lines:
+
+        line = line.strip()
+
+        # Look for a transaction date followed by a balance
+        match = re.search(
+            r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
+            r"\d{2}\s+"
+            r"([\d,]+\.\d{2})"
+            r"(OD)?\s*$",
+            line,
+            re.IGNORECASE
+        )
+
+        if match:
+
+            amount = money_to_float(
+                match.group(2)
+            )
+
+            is_overdraft = (
+                match.group(3) is not None
+            )
+
+            if is_overdraft:
+                amount = -amount
+
+            balance_candidates.append(
+                amount
+            )
+
+    if balance_candidates:
+
+        return balance_candidates[-1]
+
+    return None
+
+
+# =========================================================
+# TD ACCOUNT NUMBER
+# =========================================================
+
+def get_td_account_id(text):
+
+    """
+    Attempts to read the TD account number from:
+    0093 7431-5263645
+
+    Returns:
+    5263645
+    """
+
+    match = re.search(
+        r"\b\d{4}\s+\d{4}-(\d{7})\b",
+        text
+    )
+
+    if match:
+        return match.group(1)
+
+    return "5263645"
+
+
+# =========================================================
 # TD TRANSACTION EXTRACTION
 # =========================================================
 
@@ -144,7 +231,7 @@ def extract_td_transactions(pdf_bytes):
     full_text = ""
 
     # -----------------------------------------------------
-    # Collect all PDF text
+    # Collect PDF text
     # -----------------------------------------------------
 
     for page in doc:
@@ -161,8 +248,16 @@ def extract_td_transactions(pdf_bytes):
         full_text
     )
 
+    ending_balance = get_td_ending_balance(
+        full_text
+    )
+
+    account_id = get_td_account_id(
+        full_text
+    )
+
     # -----------------------------------------------------
-    # Process each page
+    # Process transaction pages
     # -----------------------------------------------------
 
     for page in doc:
@@ -174,9 +269,7 @@ def extract_td_transactions(pdf_bytes):
 
         page_width = page.rect.width
 
-        # -------------------------------------------------
-        # TD statement columns
-        # -------------------------------------------------
+        # TD columns based on actual TD PDF
 
         debit_left = page_width * 0.31
         debit_right = page_width * 0.47
@@ -187,7 +280,7 @@ def extract_td_transactions(pdf_bytes):
         description_right = debit_left
 
         # -------------------------------------------------
-        # Find transaction date words
+        # Find transaction dates
         # -------------------------------------------------
 
         date_words = []
@@ -312,7 +405,7 @@ def extract_td_transactions(pdf_bytes):
                 continue
 
             # -------------------------------------------------
-            # Debit and credit
+            # Debit / Credit
             # -------------------------------------------------
 
             debit = 0.0
@@ -401,7 +494,13 @@ def extract_td_transactions(pdf_bytes):
             .reset_index(drop=True)
         )
 
-    return df, control
+    statement_info = {
+        "control": control,
+        "ending_balance": ending_balance,
+        "account_id": account_id
+    }
+
+    return df, statement_info
 
 
 # =========================================================
@@ -412,8 +511,8 @@ def generate_qbo_online_csv(df):
 
     export_df = df.copy()
 
-    # Credit = money into bank = positive
-    # Debit = money out of bank = negative
+    # Money in = positive
+    # Money out = negative
 
     export_df["Amount"] = (
         export_df["Credit"]
@@ -464,6 +563,20 @@ def clean_qbo_text(text):
     return text.strip()[:255]
 
 
+def td_qbo_datetime(date_object):
+
+    """
+    Genuine TD QBO style:
+    YYYYMMDD020000[-5:EST]
+    """
+
+    return (
+        date_object.strftime("%Y%m%d")
+        +
+        "020000[-5:EST]"
+    )
+
+
 def create_fitid(
     date_text,
     description,
@@ -472,10 +585,10 @@ def create_fitid(
 ):
 
     """
-    Creates a stable unique transaction ID.
+    Creates a stable unique FITID.
 
-    If the same PDF is converted again, the same transaction
-    should receive the same FITID.
+    Converting the same transaction again will generate
+    the same FITID.
     """
 
     source = (
@@ -490,39 +603,24 @@ def create_fitid(
         source.encode("utf-8")
     ).hexdigest()
 
-    # Numeric-looking ID is closer to TD's own QBO format
+    # Produce a numeric ID similar to TD
 
-    numeric_fitid = str(
-        int(
-            digest[:15],
-            16
-        )
+    number = int(
+        digest[:14],
+        16
     )
 
-    return numeric_fitid[:20]
-
-
-def td_qbo_datetime(date_object):
-
-    """
-    Match TD Web Connect style:
-    YYYYMMDD020000[-5:EST]
-    """
-
-    return (
-        date_object.strftime("%Y%m%d")
-        +
-        "020000[-5:EST]"
-    )
+    return str(number)
 
 
 # =========================================================
-# QUICKBOOKS DESKTOP QBO GENERATOR
+# QUICKBOOKS DESKTOP QBO
 # =========================================================
 
 def generate_desktop_qbo(
     df,
-    account_id="5263645"
+    account_id,
+    ending_balance
 ):
 
     if df.empty:
@@ -534,10 +632,6 @@ def generate_desktop_qbo(
         working_df["Date"]
     )
 
-    # -----------------------------------------------------
-    # Statement dates
-    # -----------------------------------------------------
-
     first_date = (
         working_df["DateObject"]
         .min()
@@ -548,10 +642,12 @@ def generate_desktop_qbo(
         .max()
     )
 
+    # Genuine TD structure:
+    # DTSTART is YYYYMMDD only
+    # DTEND includes TD timestamp
+
     start_date = (
-        first_date.strftime(
-            "%Y%m%d"
-        )
+        first_date.strftime("%Y%m%d")
     )
 
     end_date = td_qbo_datetime(
@@ -565,14 +661,13 @@ def generate_desktop_qbo(
         "[-5:EST]"
     )
 
+    # -----------------------------------------------------
+    # Build transactions
+    # -----------------------------------------------------
+
     transaction_blocks = []
 
-    # Used to distinguish identical transactions
     duplicate_counter = {}
-
-    # -----------------------------------------------------
-    # Transactions
-    # -----------------------------------------------------
 
     for _, row in working_df.iterrows():
 
@@ -588,17 +683,18 @@ def generate_desktop_qbo(
             credit - debit
         )
 
-        transaction_date_object = (
+        date_object = (
             row["DateObject"]
         )
 
         transaction_date = (
-            transaction_date_object
-            .strftime("%Y%m%d")
+            date_object.strftime(
+                "%Y%m%d"
+            )
         )
 
         posted_date = td_qbo_datetime(
-            transaction_date_object
+            date_object
         )
 
         description = clean_qbo_text(
@@ -606,20 +702,13 @@ def generate_desktop_qbo(
         )
 
         if amount < 0:
-
-            transaction_type = (
-                "DEBIT"
-            )
-
+            transaction_type = "DEBIT"
         else:
+            transaction_type = "CREDIT"
 
-            transaction_type = (
-                "CREDIT"
-            )
-
-        # ---------------------------------------------
-        # Stable duplicate handling
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # Handle identical transactions
+        # -------------------------------------------------
 
         duplicate_key = (
             transaction_date,
@@ -649,7 +738,7 @@ def generate_desktop_qbo(
             occurrence
         )
 
-        block = (
+        transaction_block = (
             "<STMTTRN>\n"
             f"<TRNTYPE>{transaction_type}\n"
             f"<DTPOSTED>{posted_date}\n"
@@ -660,7 +749,7 @@ def generate_desktop_qbo(
         )
 
         transaction_blocks.append(
-            block
+            transaction_block
         )
 
     transactions_text = "\n".join(
@@ -668,33 +757,36 @@ def generate_desktop_qbo(
     )
 
     # -----------------------------------------------------
-    # Transaction request UID
+    # TD-style TRNUID
     # -----------------------------------------------------
-
-    trnuid_source = (
-        f"{account_id}|"
-        f"{start_date}|"
-        f"{end_date}"
-    )
-
-    trnuid_hash = hashlib.sha256(
-        trnuid_source.encode("utf-8")
-    ).hexdigest()[:12]
 
     trnuid = (
-        f"TAXSQUARE-{trnuid_hash}"
+        "QWEB - "
+        +
+        datetime.now().strftime(
+            "%Y%m%d%H%M%S"
+        )
+        +
+        "0191"
     )
 
     # -----------------------------------------------------
-    # TD-specific Web Connect structure
+    # Ledger balance
+    # -----------------------------------------------------
+
+    if ending_balance is None:
+
+        ending_balance = 0.00
+
+    ledger_balance = (
+        f"{ending_balance:.2f}"
+    )
+
+    # -----------------------------------------------------
+    # QBO FILE
     #
-    # Based on actual TD-generated QBO file:
-    #
-    # SECURITY:TYPE1
-    # INTU.BID: 00002
-    # BANKID: 300000100
-    # CAD
-    # CHECKING
+    # This structure mirrors the genuine TD-generated
+    # Web Connect file.
     # -----------------------------------------------------
 
     qbo_text = f"""OFXHEADER:100
@@ -741,6 +833,10 @@ NEWFILEUID:NONE
 <DTEND>{end_date}
 {transactions_text}
 </BANKTRANLIST>
+<LEDGERBAL>
+<BALAMT>{ledger_balance}
+<DTASOF>{end_date}
+</LEDGERBAL>
 </STMTRS>
 </STMTTRNRS>
 </BANKMSGSRSV1>
@@ -766,6 +862,7 @@ with col1:
         ]
     )
 
+
 with col2:
 
     account_type = st.selectbox(
@@ -780,7 +877,7 @@ with col2:
 
 
 # =========================================================
-# FILE UPLOAD
+# PDF UPLOAD
 # =========================================================
 
 uploaded_file = st.file_uploader(
@@ -814,7 +911,7 @@ if uploaded_file is not None:
 
             try:
 
-                df, control = (
+                df, statement_info = (
                     extract_td_transactions(
                         pdf_bytes
                     )
@@ -825,8 +922,8 @@ if uploaded_file is not None:
                 ] = df
 
                 st.session_state[
-                    "control"
-                ] = control
+                    "statement_info"
+                ] = statement_info
 
             except Exception as e:
 
@@ -845,8 +942,20 @@ if "transactions" in st.session_state:
         "transactions"
     ]
 
-    control = st.session_state[
+    statement_info = st.session_state[
+        "statement_info"
+    ]
+
+    control = statement_info[
         "control"
+    ]
+
+    ending_balance = statement_info[
+        "ending_balance"
+    ]
+
+    account_id = statement_info[
+        "account_id"
     ]
 
     st.divider()
@@ -959,10 +1068,28 @@ if "transactions" in st.session_state:
             f"{credit_count} transactions"
         )
 
+        # Show extracted ending balance
+
+        if ending_balance is not None:
+
+            if ending_balance < 0:
+
+                st.write(
+                    "Ending Balance: "
+                    f"${abs(ending_balance):,.2f} OD"
+                )
+
+            else:
+
+                st.write(
+                    "Ending Balance: "
+                    f"${ending_balance:,.2f}"
+                )
+
         reconciled = False
 
         # -------------------------------------------------
-        # Compare with statement totals
+        # Reconciliation
         # -------------------------------------------------
 
         if (
@@ -1055,23 +1182,9 @@ if "transactions" in st.session_state:
                     f"${credit_difference:,.2f}"
                 )
 
-                if not debit_count_match:
-
-                    st.write(
-                        "Debit transaction count difference: "
-                        f"{debit_count - control['debit_count']}"
-                    )
-
-                if not credit_count_match:
-
-                    st.write(
-                        "Credit transaction count difference: "
-                        f"{credit_count - control['credit_count']}"
-                    )
-
 
         # =================================================
-        # DOWNLOAD SECTION
+        # DOWNLOADS
         # =================================================
 
         st.divider()
@@ -1088,7 +1201,7 @@ if "transactions" in st.session_state:
             )
 
             # ---------------------------------------------
-            # QBO Online CSV
+            # CSV
             # ---------------------------------------------
 
             csv_data = (
@@ -1098,13 +1211,14 @@ if "transactions" in st.session_state:
             )
 
             # ---------------------------------------------
-            # QuickBooks Desktop QBO
+            # Desktop QBO
             # ---------------------------------------------
 
             qbo_data = (
                 generate_desktop_qbo(
                     edited_df,
-                    account_id="5263645"
+                    account_id,
+                    ending_balance
                 )
             )
 
