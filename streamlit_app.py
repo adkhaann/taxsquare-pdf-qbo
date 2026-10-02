@@ -484,12 +484,195 @@ def extract_td_chequing_transactions(
 
     statement_info = {
         "statement_type": "chequing",
+        "bank": "TD Canada Trust",
         "control": controls,
         "account_id": account_id,
         "ending_balance": 0.0
     }
 
     return df, statement_info
+
+
+
+# =========================================================
+# RBC BUSINESS CHEQUING
+# =========================================================
+def extract_rbc_business_chequing_transactions(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    full_text = "\n".join(p.get_text("text") for p in doc)
+
+    year_m = re.search(r"to\s+\w+\s+\d{1,2},\s+(20\d{2})", full_text, re.I)
+    year = int(year_m.group(1)) if year_m else datetime.now().year
+
+    def summary(pattern, group=1, default=None):
+        m = re.search(pattern, full_text, re.I)
+        return m.group(group) if m else default
+
+    credit_count = summary(r"Total\s+deposits\s*&\s*credits\s*\((\d+)\)")
+    credit_total = summary(r"Total\s+deposits\s*&\s*credits\s*\(\d+\)\s*\+\s*([\d,]+\.\d{2})")
+    debit_count = summary(r"Total\s+cheques\s*&\s*debits\s*\((\d+)\)")
+    debit_total = summary(r"Total\s+cheques\s*&\s*debits\s*\(\d+\)\s*-\s*([\d,]+\.\d{2})")
+    closing = summary(r"Closing\s+balance\s+on\s+.*?=\s*\$([\d,]+\.\d{2})")
+    acct = re.search(r"Account\s+number:\s*(\d{5})\s+([\d-]+)", full_text, re.I)
+    branch_id = acct.group(1) if acct else "00000"
+    account_id = re.sub(r"\D", "", acct.group(2)) if acct else "0000000"
+
+    transactions, current_date, pending = [], None, []
+
+    for page in doc:
+        words = page.get_text("words")
+        headers = [w for w in words if w[4].strip().lower() == "description"]
+        if not headers:
+            continue
+        start_y = max(w[1] for w in headers) + 10
+        rows = {}
+        for w in words:
+            if w[1] >= start_y:
+                rows.setdefault(round(w[1] / 2) * 2, []).append(w)
+
+        for y in sorted(rows):
+            row = sorted(rows[y], key=lambda w: w[0])
+            row_text = " ".join(w[4] for w in row).strip()
+            if re.search(r"\bClosing\s+balance\b|\bAccount\s+Fees\b", row_text, re.I):
+                pending = []
+                break
+
+            dm = re.match(r"^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", row_text, re.I)
+            if dm:
+                current_date = datetime.strptime(
+                    f"{dm.group(2)} {dm.group(1)} {year}", "%b %d %Y"
+                ).strftime("%Y-%m-%d")
+
+            debit = credit = 0.0
+            for w in row:
+                s = w[4].replace("$", "").replace(",", "").strip()
+                if re.fullmatch(r"\d+\.\d{2}", s):
+                    xr = ((w[0] + w[2]) / 2) / page.rect.width
+                    if 0.50 <= xr < 0.68:
+                        debit = clean_amount(s)
+                    elif 0.68 <= xr < 0.82:
+                        credit = clean_amount(s)
+
+            parts = []
+            for w in row:
+                xr = ((w[0] + w[2]) / 2) / page.rect.width
+                if 0.10 <= xr < 0.50:
+                    parts.append(w[4].strip())
+            desc = " ".join(parts).strip()
+
+            if debit == 0 and credit == 0:
+                if desc and "opening balance" not in desc.lower():
+                    pending.append(desc)
+                continue
+
+            if current_date:
+                full_desc = " ".join(pending + [desc]).strip() or "RBC transaction"
+                pending = []
+                transactions.append({
+                    "Date": current_date, "Description": full_desc,
+                    "Debit": debit, "Credit": credit
+                })
+
+    doc.close()
+    df = pd.DataFrame(transactions)
+    if not df.empty:
+        df["Debit"] = pd.to_numeric(df["Debit"], errors="coerce").fillna(0)
+        df["Credit"] = pd.to_numeric(df["Credit"], errors="coerce").fillna(0)
+
+    controls = {
+        "credit_count": int(credit_count) if credit_count else None,
+        "credit_total": clean_amount(credit_total) if credit_total else None,
+        "debit_count": int(debit_count) if debit_count else None,
+        "debit_total": clean_amount(debit_total) if debit_total else None
+    }
+    return df, {
+        "statement_type": "chequing", "bank": "RBC Royal Bank",
+        "control": controls, "account_id": account_id,
+        "branch_id": branch_id,
+        "ending_balance": clean_amount(closing) if closing else 0.0
+    }
+
+
+def generate_rbc_business_chequing_qbo(df, account_id, branch_id, ending_balance):
+    working_df = df.copy()
+    working_df["DateObject"] = pd.to_datetime(working_df["Date"])
+    first_date, last_date = working_df["DateObject"].min(), working_df["DateObject"].max()
+    start_date, end_date = qbo_datetime(first_date), qbo_datetime(last_date)
+    server_time = datetime.now().strftime("%Y%m%d%H%M%S")
+    blocks, duplicate_counter = [], {}
+
+    for _, row in working_df.iterrows():
+        amount = float(row["Credit"]) - float(row["Debit"])
+        d = row["DateObject"]
+        date_text = d.strftime("%Y%m%d")
+        desc = clean_qbo_text(row["Description"])
+        key = (date_text, desc, f"{amount:.2f}")
+        duplicate_counter[key] = duplicate_counter.get(key, 0) + 1
+        fitid = create_fitid("RBCCHEQ", date_text, desc, amount, duplicate_counter[key])
+        trntype = "DEBIT" if amount < 0 else "CREDIT"
+        blocks.append(
+            "<STMTTRN>\n"
+            f"<TRNTYPE>{trntype}\n<DTPOSTED>{qbo_datetime(d)}\n"
+            f"<TRNAMT>{amount:.2f}\n<FITID>{fitid}\n"
+            f"<NAME>{desc[:32]}\n<MEMO>{desc[:255]}\n</STMTTRN>"
+        )
+
+    transaction_text = "\n".join(blocks)
+    bal = float(ending_balance or 0)
+    return f"""OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+SECURITY:NONE
+ENCODING:USASCII
+CHARSET:1252
+COMPRESSION:NONE
+OLDFILEUID:NONE
+NEWFILEUID:NONE
+
+<OFX>
+<SIGNONMSGSRSV1>
+<SONRS>
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+</STATUS>
+<DTSERVER>{server_time}
+<LANGUAGE>ENG
+<FI>
+<ORG>Royal Bank of Canada
+<FID>003
+</FI>
+</SONRS>
+</SIGNONMSGSRSV1>
+<BANKMSGSRSV1>
+<STMTTRNRS>
+<TRNUID>1
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+</STATUS>
+<STMTRS>
+<CURDEF>CAD
+<BANKACCTFROM>
+<BANKID>003
+<BRANCHID>{branch_id}
+<ACCTID>{account_id}
+<ACCTTYPE>CHECKING
+</BANKACCTFROM>
+<BANKTRANLIST>
+<DTSTART>{start_date}
+<DTEND>{end_date}
+{transaction_text}
+</BANKTRANLIST>
+<LEDGERBAL>
+<BALAMT>{bal:.2f}
+<DTASOF>{end_date}
+</LEDGERBAL>
+</STMTRS>
+</STMTTRNRS>
+</BANKMSGSRSV1>
+</OFX>
+"""
 
 
 # =========================================================
@@ -1383,7 +1566,8 @@ ACCOUNT_TYPES = [
 
 SUPPORTED_COMBINATIONS = {
     ("TD Canada Trust", "Business Chequing"),
-    ("TD Canada Trust", "Credit Card")
+    ("TD Canada Trust", "Credit Card"),
+    ("RBC Royal Bank", "Business Chequing")
 }
 
 
@@ -1470,6 +1654,18 @@ if uploaded_file is not None:
 
                 df, statement_info = (
                     extract_td_chequing_transactions(
+                        pdf_bytes
+                    )
+                )
+
+            elif (
+                bank == "RBC Royal Bank"
+                and
+                account_type == "Business Chequing"
+            ):
+
+                df, statement_info = (
+                    extract_rbc_business_chequing_transactions(
                         pdf_bytes
                     )
                 )
@@ -1986,14 +2182,27 @@ if "transactions" in st.session_state:
                 == "chequing"
             ):
 
-                qbo_data = (
-                    generate_td_chequing_qbo(
-                        edited_df,
-                        statement_info[
-                            "account_id"
-                        ]
+                if statement_info.get("bank") == "RBC Royal Bank":
+
+                    qbo_data = (
+                        generate_rbc_business_chequing_qbo(
+                            edited_df,
+                            statement_info["account_id"],
+                            statement_info.get("branch_id", "00000"),
+                            statement_info.get("ending_balance")
+                        )
                     )
-                )
+
+                else:
+
+                    qbo_data = (
+                        generate_td_chequing_qbo(
+                            edited_df,
+                            statement_info[
+                                "account_id"
+                            ]
+                        )
+                    )
 
             else:
 
