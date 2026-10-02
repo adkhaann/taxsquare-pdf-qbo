@@ -1533,6 +1533,267 @@ NEWFILEUID:NONE
 """
 
 
+
+# =========================================================
+# SCOTIABANK BUSINESS CHEQUING
+# =========================================================
+
+def get_scotiabank_business_chequing_summary(full_text):
+    result = {
+        "statement_year": datetime.now().year,
+        "debit_count": None,
+        "debit_total": None,
+        "credit_count": None,
+        "credit_total": None,
+        "ending_balance": None,
+        # Genuine Scotiabank QuickBooks QBO supplied for this account.
+        "account_id": "307420174815"
+    }
+
+    period_match = re.search(
+        r"Business\s+Account\s+\d+\s+\d+\s+\d+\s+"
+        r"[A-Za-z]+\s+\d{1,2}\s+(20\d{2})\s+"
+        r"[A-Za-z]+\s+\d{1,2}\s+(20\d{2})",
+        full_text,
+        re.IGNORECASE
+    )
+    if period_match:
+        result["statement_year"] = int(period_match.group(2))
+
+    controls = re.search(
+        r"No\.\s+of\s+Debits\s+Total\s+Amount\s*-\s*Debits\s+"
+        r"No\.\s+of\s+Credits\s+Total\s+Amount\s*-\s*Credits\s+"
+        r"(\d+)\s+\$([\d,]+\.\d{2})\s+(\d+)\s+\$([\d,]+\.\d{2})",
+        full_text,
+        re.IGNORECASE
+    )
+    if controls:
+        result["debit_count"] = int(controls.group(1))
+        result["debit_total"] = clean_amount(controls.group(2))
+        result["credit_count"] = int(controls.group(3))
+        result["credit_total"] = clean_amount(controls.group(4))
+
+    # Last balance on a real transaction row is the statement ending balance.
+    balance_matches = re.findall(
+        r"\d{2}/\d{2}/20\d{2}\s+.+?\s+"
+        r"([\d,]+\.\d{2}-?)\s*$",
+        full_text,
+        re.MULTILINE
+    )
+    if balance_matches:
+        raw = balance_matches[-1]
+        negative = raw.endswith("-")
+        value = clean_amount(raw.rstrip("-"))
+        result["ending_balance"] = -value if negative else value
+
+    return result
+
+
+def extract_scotiabank_business_chequing_transactions(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    full_text = "\n".join(page.get_text("text") for page in doc)
+    info = get_scotiabank_business_chequing_summary(full_text)
+
+    transactions = []
+
+    for page in doc:
+        rows = {}
+        for word in page.get_text("words"):
+            row_key = round(word[1], 1)
+            rows.setdefault(row_key, []).append(word)
+
+        for row_y in sorted(rows):
+            row = sorted(rows[row_y], key=lambda w: w[0])
+            texts = [w[4].strip() for w in row if w[4].strip()]
+            if len(texts) < 3:
+                continue
+
+            date_match = re.fullmatch(
+                r"\d{2}/\d{2}/20\d{2}",
+                texts[0]
+            )
+            if not date_match:
+                continue
+
+            row_text = " ".join(texts)
+            if "BALANCE FORWARD" in row_text.upper():
+                continue
+
+            debit = 0.0
+            credit = 0.0
+
+            # Use column position rather than relying on text order.
+            for w in row:
+                x0, y0, x1, y1, text = w[:5]
+                cleaned = text.replace("$", "").replace(",", "").replace("-", "").strip()
+
+                if not re.fullmatch(r"\d+\.\d{2}", cleaned):
+                    continue
+
+                amount = float(cleaned)
+                x_ratio = ((x0 + x1) / 2) / page.rect.width
+
+                # Scotiabank PDF table:
+                # Description | Withdrawals/Debits | Deposits/Credits | Balance
+                if 0.48 <= x_ratio < 0.66:
+                    debit = amount
+                elif 0.66 <= x_ratio < 0.82:
+                    credit = amount
+
+            if debit == 0 and credit == 0:
+                continue
+
+            description = " ".join(
+                w[4].strip()
+                for w in row
+                if 0.15 <= (((w[0] + w[2]) / 2) / page.rect.width) < 0.48
+            ).strip()
+
+            date_obj = datetime.strptime(texts[0], "%m/%d/%Y")
+
+            transactions.append({
+                "Date": date_obj.strftime("%Y-%m-%d"),
+                "Description": description or "Scotiabank transaction",
+                "Debit": debit,
+                "Credit": credit
+            })
+
+    doc.close()
+
+    df = pd.DataFrame(transactions)
+
+    if not df.empty:
+        df["Debit"] = pd.to_numeric(df["Debit"], errors="coerce").fillna(0.0)
+        df["Credit"] = pd.to_numeric(df["Credit"], errors="coerce").fillna(0.0)
+        df = df.reset_index(drop=True)
+
+    controls = {
+        "debit_count": info["debit_count"],
+        "debit_total": info["debit_total"],
+        "credit_count": info["credit_count"],
+        "credit_total": info["credit_total"]
+    }
+
+    return df, {
+        "statement_type": "chequing",
+        "bank": "Scotiabank",
+        "control": controls,
+        "account_id": info["account_id"],
+        "ending_balance": info["ending_balance"]
+    }
+
+
+def generate_scotiabank_chequing_qbo(df, account_id, ending_balance):
+    """
+    Scotiabank Business Chequing QBO.
+    Institution/account structure mirrors the genuine QBO supplied by user.
+    """
+    working_df = df.copy()
+    working_df["DateObject"] = pd.to_datetime(working_df["Date"])
+
+    def scotia_dt(value):
+        return value.strftime("%Y%m%d") + "120000.000[-5:EST]"
+
+    first_date = working_df["DateObject"].min()
+    last_date = working_df["DateObject"].max()
+    server_time = datetime.now().strftime("%Y%m%d%H%M%S") + ".000[-5:EST]"
+
+    blocks = []
+    duplicate_counter = {}
+
+    for _, row in working_df.iterrows():
+        debit = float(row["Debit"])
+        credit = float(row["Credit"])
+        amount = credit - debit
+        date_obj = row["DateObject"]
+        date_text = date_obj.strftime("%Y%m%d")
+        desc = clean_qbo_text(row["Description"])
+
+        key = (date_text, desc, f"{amount:.2f}")
+        duplicate_counter[key] = duplicate_counter.get(key, 0) + 1
+
+        fitid = create_fitid(
+            "SCOTIACHEQ",
+            date_text,
+            desc,
+            amount,
+            duplicate_counter[key]
+        )
+
+        trntype = "DEBIT" if amount < 0 else "CREDIT"
+
+        blocks.append(
+            "<STMTTRN>\n"
+            f"<TRNTYPE>{trntype}\n"
+            f"<DTPOSTED>{scotia_dt(date_obj)}\n"
+            f"<TRNAMT>{amount:.2f}\n"
+            f"<FITID>{fitid}\n"
+            f"<NAME>{desc[:32]}\n"
+            f"<MEMO>{desc[:255]}\n"
+            "</STMTTRN>"
+        )
+
+    transaction_text = "\n".join(blocks)
+    balance = float(ending_balance or 0.0)
+
+    return f"""OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+SECURITY:NONE
+ENCODING:USASCII
+CHARSET:1252
+COMPRESSION:NONE
+OLDFILEUID:NONE
+NEWFILEUID:NONE
+
+<OFX>
+<SIGNONMSGSRSV1>
+<SONRS>
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+<MESSAGE>OK
+</STATUS>
+<DTSERVER>{server_time}
+<LANGUAGE>ENG
+<INTU.BID>00025
+</SONRS>
+</SIGNONMSGSRSV1>
+<BANKMSGSRSV1>
+<STMTTRNRS>
+<TRNUID>1
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+<MESSAGE>OK
+</STATUS>
+<STMTRS>
+<CURDEF>CAD
+<BANKACCTFROM>
+<BANKID>170000100
+<ACCTID>{account_id}
+<ACCTTYPE>CHECKING
+</BANKACCTFROM>
+<BANKTRANLIST>
+<DTSTART>{scotia_dt(first_date)}
+<DTEND>{scotia_dt(last_date)}
+{transaction_text}
+</BANKTRANLIST>
+<LEDGERBAL>
+<BALAMT>{balance:.2f}
+<DTASOF>{scotia_dt(last_date)}
+</LEDGERBAL>
+<AVAILBAL>
+<BALAMT>{balance:.2f}
+<DTASOF>{scotia_dt(last_date)}
+</AVAILBAL>
+</STMTRS>
+</STMTTRNRS>
+</BANKMSGSRSV1>
+</OFX>
+"""
+
+
 # =========================================================
 # CREDIT CARD SUMMARY
 # =========================================================
@@ -2428,7 +2689,8 @@ SUPPORTED_COMBINATIONS = {
     ("RBC Royal Bank", "Business Chequing"),
     ("RBC Royal Bank", "Credit Card"),
     ("BMO Bank of Montreal", "Business Chequing"),
-    ("BMO Bank of Montreal", "Credit Card")
+    ("BMO Bank of Montreal", "Credit Card"),
+    ("Scotiabank", "Business Chequing")
 }
 
 
@@ -2515,6 +2777,18 @@ if uploaded_file is not None:
 
                 df, statement_info = (
                     extract_td_chequing_transactions(
+                        pdf_bytes
+                    )
+                )
+
+            elif (
+                bank == "Scotiabank"
+                and
+                account_type == "Business Chequing"
+            ):
+
+                df, statement_info = (
+                    extract_scotiabank_business_chequing_transactions(
                         pdf_bytes
                     )
                 )
@@ -3094,6 +3368,16 @@ if "transactions" in st.session_state:
 
                     qbo_data = (
                         generate_bmo_chequing_qbo(
+                            edited_df,
+                            statement_info["account_id"],
+                            statement_info.get("ending_balance")
+                        )
+                    )
+
+                elif statement_info.get("bank") == "Scotiabank":
+
+                    qbo_data = (
+                        generate_scotiabank_chequing_qbo(
                             edited_df,
                             statement_info["account_id"],
                             statement_info.get("ending_balance")
