@@ -671,6 +671,387 @@ NEWFILEUID:NONE
 """
 
 
+
+# =========================================================
+# RBC BUSINESS MASTERCARD
+# =========================================================
+
+def get_rbc_mastercard_summary(full_text):
+    """Read RBC Mastercard statement control totals."""
+
+    summary = {
+        "previous_balance": None,
+        "payments_credits": None,
+        "purchases_charges": None,
+        "interest": 0.0,
+        "fees": 0.0,
+        "new_balance": None,
+        "statement_year": datetime.now().year,
+        "account_id": "10000003"
+    }
+
+    period_match = re.search(
+        r"STATEMENT\s+FROM\s+[A-Z]{3}\s+\d{1,2}\s+TO\s+"
+        r"[A-Z]{3}\s+\d{1,2},\s+(20\d{2})",
+        full_text,
+        re.IGNORECASE
+    )
+    if period_match:
+        summary["statement_year"] = int(period_match.group(1))
+
+    patterns = {
+        "previous_balance":
+            r"Previous\s+Statement\s+Balance\s+\$([\d,]+\.\d{2})",
+        "payments_credits":
+            r"Payments\s*&\s*credits\s+-\$([\d,]+\.\d{2})",
+        "purchases_charges":
+            r"Purchases\s*&\s*debits\s+\$([\d,]+\.\d{2})",
+        "interest":
+            r"Interest\s+\$([\d,]+\.\d{2})",
+        "fees":
+            r"Fees\s+\$([\d,]+\.\d{2})",
+        "new_balance":
+            r"NEW\s+BALANCE\s+\$([\d,]+\.\d{2})"
+    }
+
+    for key, pattern in patterns.items():
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            summary[key] = clean_amount(match.group(1))
+
+    return summary
+
+
+def extract_rbc_mastercard_transactions(pdf_bytes):
+    """
+    Parse RBC Business Cash Back Mastercard statements.
+
+    RBC transaction rows contain:
+    transaction date | posting date | description | amount.
+
+    Purchases are positive on the PDF and become Debit values in the app.
+    Payments are printed as negative amounts and become Credit values.
+    """
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    full_text = "\n".join(
+        page.get_text("text") for page in doc
+    )
+
+    summary = get_rbc_mastercard_summary(full_text)
+    statement_year = summary["statement_year"]
+
+    month_numbers = {
+        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
+        "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
+        "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
+    }
+
+    transactions = []
+
+    for page in doc:
+
+        rows = {}
+
+        for word in page.get_text("words"):
+            x0, y0, x1, y1, text = word[:5]
+
+            # Transaction table is on the left side of RBC card pages.
+            if x0 >= 370:
+                continue
+
+            row_key = round(y0, 1)
+            rows.setdefault(row_key, []).append(word)
+
+        for row_y in sorted(rows):
+
+            row = sorted(
+                rows[row_y],
+                key=lambda item: item[0]
+            )
+
+            texts = [
+                item[4].strip()
+                for item in row
+                if item[4].strip()
+            ]
+
+            if len(texts) < 5:
+                continue
+
+            # A real RBC transaction row begins:
+            # APR 14 APR 16 ...
+            if (
+                texts[0].upper() not in month_numbers
+                or not re.fullmatch(r"\d{1,2}", texts[1])
+                or texts[2].upper() not in month_numbers
+                or not re.fullmatch(r"\d{1,2}", texts[3])
+            ):
+                continue
+
+            amount = None
+
+            for word in row:
+                text = word[4].replace(",", "").strip()
+
+                if re.fullmatch(
+                    r"-?\$\d+(?:\.\d{2})",
+                    text
+                ):
+                    amount = float(
+                        text.replace("$", "")
+                    )
+
+            if amount is None:
+                continue
+
+            transaction_month = month_numbers[
+                texts[0].upper()
+            ]
+            transaction_day = int(texts[1])
+
+            # Handle statements crossing Dec/Jan.
+            transaction_year = statement_year
+            if (
+                transaction_month == 12
+                and
+                re.search(
+                    r"TO\s+JAN\s+\d{1,2},\s+"
+                    + str(statement_year),
+                    full_text,
+                    re.IGNORECASE
+                )
+            ):
+                transaction_year -= 1
+
+            date_object = datetime(
+                transaction_year,
+                transaction_month,
+                transaction_day
+            )
+
+            # Description words sit between posting date and amount.
+            description_words = []
+
+            for word in row:
+                x0, y0, x1, y1, text = word[:5]
+
+                if 120 <= x0 < 305:
+                    description_words.append(
+                        text.strip()
+                    )
+
+            description = " ".join(
+                description_words
+            ).strip()
+
+            if not description:
+                description = "RBC Mastercard transaction"
+
+            # PDF convention:
+            # positive = purchase/debit
+            # negative = payment/credit
+            if amount < 0:
+                debit = 0.0
+                credit = abs(amount)
+            else:
+                debit = amount
+                credit = 0.0
+
+            transactions.append({
+                "Date": date_object.strftime("%Y-%m-%d"),
+                "Description": description,
+                "Debit": debit,
+                "Credit": credit
+            })
+
+    doc.close()
+
+    df = pd.DataFrame(transactions)
+
+    if not df.empty:
+        df["Debit"] = pd.to_numeric(
+            df["Debit"],
+            errors="coerce"
+        ).fillna(0.0)
+
+        df["Credit"] = pd.to_numeric(
+            df["Credit"],
+            errors="coerce"
+        ).fillna(0.0)
+
+        df = df.sort_values(
+            by=["Date"],
+            kind="stable"
+        ).reset_index(drop=True)
+
+    statement_info = {
+        "statement_type": "credit_card",
+        "bank": "RBC Royal Bank",
+        "account_id": summary["account_id"],
+        "summary": summary
+    }
+
+    return df, statement_info
+
+
+def generate_rbc_mastercard_qbo(
+    df,
+    account_id,
+    new_balance
+):
+    """
+    Generate RBC Mastercard QuickBooks Desktop Web Connect QBO.
+
+    Structure mirrors the genuine RBC QBO supplied for this account:
+    INTU.BID 00015
+    CREDITCARDMSGSRSV1 / CCSTMTRS
+    CCACCTFROM
+    ACCTID 10000003
+    """
+
+    working_df = df.copy()
+    working_df["DateObject"] = pd.to_datetime(
+        working_df["Date"]
+    )
+
+    first_date = working_df["DateObject"].min()
+    last_date = working_df["DateObject"].max()
+
+    def rbc_ofx_dt(value):
+        return (
+            value.strftime("%Y%m%d")
+            + "130000.000[-4]"
+        )
+
+    start_date = rbc_ofx_dt(first_date)
+    end_date = rbc_ofx_dt(last_date)
+
+    server_time = (
+        datetime.now().strftime("%Y%m%d%H%M%S")
+        + ".000[-4]"
+    )
+
+    transaction_blocks = []
+    duplicate_counter = {}
+
+    for _, row in working_df.iterrows():
+
+        debit = float(row["Debit"])
+        credit = float(row["Credit"])
+
+        # Credit-card OFX:
+        # purchase = negative
+        # payment/refund = positive
+        amount = credit - debit
+
+        date_object = row["DateObject"]
+        date_text = date_object.strftime("%Y%m%d")
+        description = clean_qbo_text(
+            row["Description"]
+        )
+
+        duplicate_key = (
+            date_text,
+            description,
+            f"{amount:.2f}"
+        )
+
+        duplicate_counter[duplicate_key] = (
+            duplicate_counter.get(
+                duplicate_key,
+                0
+            )
+            + 1
+        )
+
+        fitid = create_fitid(
+            "RBCMC",
+            date_text,
+            description,
+            amount,
+            duplicate_counter[
+                duplicate_key
+            ]
+        )
+
+        trntype = (
+            "DEBIT"
+            if amount < 0
+            else "CREDIT"
+        )
+
+        transaction_blocks.append(
+            "<STMTTRN>\n"
+            f"<TRNTYPE>{trntype}\n"
+            f"<DTPOSTED>{rbc_ofx_dt(date_object)}\n"
+            f"<TRNAMT>{amount:.2f}\n"
+            f"<FITID>{fitid}\n"
+            f"<NAME>{description[:32]}\n"
+            f"<MEMO>{description[:255]}\n"
+            "</STMTTRN>"
+        )
+
+    transactions_text = "\n".join(
+        transaction_blocks
+    )
+
+    # Genuine RBC Mastercard QBO uses 0.00 here.
+    ledger_balance = 0.00
+
+    return f"""OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+SECURITY:NONE
+ENCODING:USASCII
+CHARSET:1252
+COMPRESSION:NONE
+OLDFILEUID:NONE
+NEWFILEUID:NONE
+
+<OFX>
+<SIGNONMSGSRSV1>
+<SONRS>
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+<MESSAGE>OK
+</STATUS>
+<DTSERVER>{server_time}
+<LANGUAGE>ENG
+<INTU.BID>00015
+</SONRS>
+</SIGNONMSGSRSV1>
+<CREDITCARDMSGSRSV1>
+<CCSTMTTRNRS>
+<TRNUID>0
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+<MESSAGE>OK
+</STATUS>
+<CCSTMTRS>
+<CURDEF>CAD
+<CCACCTFROM>
+<ACCTID>{account_id}
+</CCACCTFROM>
+<BANKTRANLIST>
+<DTSTART>{start_date}
+<DTEND>{end_date}
+{transactions_text}
+</BANKTRANLIST>
+<LEDGERBAL>
+<BALAMT>{ledger_balance:.2f}
+<DTASOF>{end_date}
+</LEDGERBAL>
+</CCSTMTRS>
+</CCSTMTTRNRS>
+</CREDITCARDMSGSRSV1>
+</OFX>
+"""
+
+
 # =========================================================
 # CREDIT CARD SUMMARY
 # =========================================================
@@ -1563,7 +1944,8 @@ ACCOUNT_TYPES = [
 SUPPORTED_COMBINATIONS = {
     ("TD Canada Trust", "Business Chequing"),
     ("TD Canada Trust", "Credit Card"),
-    ("RBC Royal Bank", "Business Chequing")
+    ("RBC Royal Bank", "Business Chequing"),
+    ("RBC Royal Bank", "Credit Card")
 }
 
 
@@ -1650,6 +2032,18 @@ if uploaded_file is not None:
 
                 df, statement_info = (
                     extract_td_chequing_transactions(
+                        pdf_bytes
+                    )
+                )
+
+            elif (
+                bank == "RBC Royal Bank"
+                and
+                account_type == "Credit Card"
+            ):
+
+                df, statement_info = (
+                    extract_rbc_mastercard_transactions(
                         pdf_bytes
                     )
                 )
@@ -1999,38 +2393,38 @@ if "transactions" in st.session_state:
             if previous_balance is not None:
 
                 st.write(
-                    "TD Previous Balance: "
+                    "Previous Balance: "
                     f"${previous_balance:,.2f}"
                 )
 
             if purchases is not None:
 
                 st.write(
-                    "TD Purchases & Other Charges: "
+                    "Purchases & Charges: "
                     f"${purchases:,.2f}"
                 )
 
             st.write(
-                "TD Interest: "
+                "Interest: "
                 f"${interest:,.2f}"
             )
 
             st.write(
-                "TD Fees: "
+                "Fees: "
                 f"${fees:,.2f}"
             )
 
             if payments is not None:
 
                 st.write(
-                    "TD Payments & Credits: "
+                    "Payments & Credits: "
                     f"${payments:,.2f}"
                 )
 
             if new_balance is not None:
 
                 st.write(
-                    "TD New Balance: "
+                    "New Balance: "
                     f"${new_balance:,.2f}"
                 )
 
@@ -2202,19 +2596,40 @@ if "transactions" in st.session_state:
 
             else:
 
-                qbo_data = (
-                    generate_td_credit_card_qbo(
-                        edited_df,
-                        statement_info[
-                            "account_id"
-                        ],
-                        statement_info[
-                            "summary"
-                        ].get(
-                            "new_balance"
+                if (
+                    statement_info.get("bank")
+                    == "RBC Royal Bank"
+                ):
+
+                    qbo_data = (
+                        generate_rbc_mastercard_qbo(
+                            edited_df,
+                            statement_info[
+                                "account_id"
+                            ],
+                            statement_info[
+                                "summary"
+                            ].get(
+                                "new_balance"
+                            )
                         )
                     )
-                )
+
+                else:
+
+                    qbo_data = (
+                        generate_td_credit_card_qbo(
+                            edited_df,
+                            statement_info[
+                                "account_id"
+                            ],
+                            statement_info[
+                                "summary"
+                            ].get(
+                                "new_balance"
+                            )
+                        )
+                    )
 
             col1, col2 = (
                 st.columns(2)
