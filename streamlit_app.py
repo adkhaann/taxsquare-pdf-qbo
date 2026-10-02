@@ -19,7 +19,7 @@ st.set_page_config(
 st.title("PDF to QuickBooks Converter")
 
 st.write(
-    "Convert TD bank and credit-card PDF statements into "
+    "Convert supported Canadian bank and credit-card PDF statements into "
     "QuickBooks Online CSV or QuickBooks Desktop QBO files."
 )
 
@@ -1336,25 +1336,93 @@ NEWFILEUID:NONE
 # USER INTERFACE
 # =========================================================
 
+# =========================================================
+# BANK / ACCOUNT SELECTION
+#
+# IMPORTANT:
+# Adding a bank to the dropdown does NOT activate a parser.
+# Only combinations in SUPPORTED_COMBINATIONS can process
+# statements. This protects the working TD logic.
+# =========================================================
+
+CANADIAN_BANKS = [
+    "TD Canada Trust",
+    "RBC Royal Bank",
+    "Scotiabank",
+    "BMO Bank of Montreal",
+    "CIBC",
+    "National Bank of Canada",
+    "Desjardins",
+    "Tangerine Bank",
+    "Simplii Financial",
+    "EQ Bank",
+    "ATB Financial",
+    "Laurentian Bank of Canada",
+    "Canadian Western Bank",
+    "Manulife Bank",
+    "PC Financial",
+    "Wealthsimple",
+    "Motusbank",
+    "Home Trust",
+    "First Nations Bank of Canada",
+    "Coast Capital Savings",
+    "Meridian Credit Union",
+    "Vancity",
+    "Servus Credit Union",
+    "Other Canadian Bank / Credit Union"
+]
+
+ACCOUNT_TYPES = [
+    "Personal Chequing",
+    "Business Chequing",
+    "Personal Savings",
+    "Business Savings",
+    "Credit Card",
+    "Line of Credit"
+]
+
+SUPPORTED_COMBINATIONS = {
+    ("TD Canada Trust", "Business Chequing"),
+    ("TD Canada Trust", "Credit Card")
+}
+
+
 col1, col2 = st.columns(2)
 
 with col1:
 
     bank = st.selectbox(
         "Bank",
-        [
-            "TD Canada Trust"
-        ]
+        CANADIAN_BANKS
     )
 
 with col2:
 
     account_type = st.selectbox(
         "Account Type",
-        [
-            "Business Chequing",
-            "Credit Card"
-        ]
+        ACCOUNT_TYPES,
+        index=1
+    )
+
+
+is_supported = (
+    bank,
+    account_type
+) in SUPPORTED_COMBINATIONS
+
+
+if is_supported:
+
+    st.success(
+        f"Supported: {bank} - {account_type}"
+    )
+
+else:
+
+    st.info(
+        f"{bank} - {account_type} is listed but not activated yet. "
+        "A sample PDF statement must be tested before this combination "
+        "is enabled."
     )
 
 
@@ -1372,7 +1440,8 @@ if uploaded_file is not None:
 
     if st.button(
         "Process Statement",
-        type="primary"
+        type="primary",
+        disabled=not is_supported
     ):
 
         pdf_bytes = (
@@ -1382,8 +1451,9 @@ if uploaded_file is not None:
         try:
 
             if (
-                account_type
-                == "Credit Card"
+                bank == "TD Canada Trust"
+                and
+                account_type == "Credit Card"
             ):
 
                 df, statement_info = (
@@ -1392,13 +1462,24 @@ if uploaded_file is not None:
                     )
                 )
 
-            else:
+            elif (
+                bank == "TD Canada Trust"
+                and
+                account_type == "Business Chequing"
+            ):
 
                 df, statement_info = (
                     extract_td_chequing_transactions(
                         pdf_bytes
                     )
                 )
+
+            else:
+
+                st.error(
+                    "This bank/account combination is not activated yet."
+                )
+                st.stop()
 
             st.session_state[
                 "transactions"
@@ -1407,6 +1488,10 @@ if uploaded_file is not None:
             st.session_state[
                 "statement_info"
             ] = statement_info
+
+            st.session_state[
+                "processed_bank"
+            ] = bank
 
             st.session_state[
                 "processed_account_type"
