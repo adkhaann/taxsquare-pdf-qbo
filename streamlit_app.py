@@ -642,6 +642,7 @@ NEWFILEUID:NONE
 <ORG>Royal Bank of Canada
 <FID>003
 </FI>
+<INTU.BID>0002
 </SONRS>
 </SIGNONMSGSRSV1>
 <BANKMSGSRSV1>
@@ -1864,7 +1865,7 @@ if "transactions" in st.session_state:
             ):
 
                 st.write(
-                    "TD Statement Debits: "
+                    "Statement Debits: "
                     f"{controls['debit_count']} "
                     "transactions, "
                     f"${controls['debit_total']:,.2f}"
@@ -1878,7 +1879,7 @@ if "transactions" in st.session_state:
             ):
 
                 st.write(
-                    "TD Statement Credits: "
+                    "Statement Credits: "
                     f"{controls['credit_count']} "
                     "transactions, "
                     f"${controls['credit_total']:,.2f}"
