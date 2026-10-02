@@ -1212,7 +1212,7 @@ def get_bmo_credit_card_summary(full_text):
 
     patterns = {
         "previous_balance":
-            r"Previous\s+total\s+balance.*?\$([\d,]+\.\d{2})",
+            r"Previous\s+total\s+balance[^\n\r]*?\$?\s*([\d,]+\.\d{2})",
         "payments_credits":
             r"Payments\s+and\s+credits\s+\$?([\d,]+\.\d{2})",
         "purchases_charges":
@@ -1229,6 +1229,17 @@ def get_bmo_credit_card_summary(full_text):
         m = re.search(pattern, full_text, re.IGNORECASE)
         if m:
             summary[key] = clean_amount(m.group(1))
+
+    # BMO fallback: PDF text extraction can split the previous-balance line
+    # differently from the other summary lines.
+    if summary["previous_balance"] is None:
+        m = re.search(
+            r"Previous\s+total\s+balance[\s\S]{0,80}?([0-9]{1,3}(?:,[0-9]{3})*\.\d{2})",
+            full_text,
+            re.IGNORECASE
+        )
+        if m:
+            summary["previous_balance"] = clean_amount(m.group(1))
 
     year_match = re.search(
         r"Statement\s+date\s+[A-Za-z]+\.\s+\d{1,2},\s+(20\d{2})",
