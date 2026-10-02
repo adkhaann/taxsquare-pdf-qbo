@@ -1052,6 +1052,476 @@ NEWFILEUID:NONE
 """
 
 
+
+# =========================================================
+# BMO BUSINESS CHEQUING + BUSINESS MASTERCARD
+# =========================================================
+
+def get_bmo_chequing_summary(full_text):
+    result = {
+        "statement_year": datetime.now().year,
+        "opening_balance": None,
+        "closing_balance": None,
+        "debit_total": None,
+        "credit_total": None,
+        "debit_count": None,
+        "credit_count": None,
+        # Genuine BMO QuickBooks Web Connect file supplied for this account.
+        "account_id": "52733500128408471"
+    }
+
+    period = re.search(
+        r"period\s+ending\s+([A-Za-z]+)\s+\d{1,2},\s+(20\d{2})",
+        full_text,
+        re.IGNORECASE
+    )
+    if period:
+        result["statement_year"] = int(period.group(2))
+
+    summary_row = re.search(
+        r"#\s*\d{4}\s+[\d-]+\s+([\d,]+\.\d{2})\s+"
+        r"([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})",
+        full_text
+    )
+    if summary_row:
+        result["opening_balance"] = clean_amount(summary_row.group(1))
+        result["debit_total"] = clean_amount(summary_row.group(2))
+        result["credit_total"] = clean_amount(summary_row.group(3))
+        result["closing_balance"] = clean_amount(summary_row.group(4))
+
+    items = re.search(
+        r"Number\s+of\s+items\s+processed.*?(\d+)",
+        full_text,
+        re.IGNORECASE
+    )
+    if items:
+        total_items = int(items.group(1))
+        # The statement does not split the item count by debit/credit.
+        result["item_count"] = total_items
+
+    return result
+
+
+def extract_bmo_business_chequing_transactions(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    full_text = "\n".join(page.get_text("text") for page in doc)
+    info = get_bmo_chequing_summary(full_text)
+
+    transactions = []
+    month_map = {
+        "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
+        "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
+        "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12
+    }
+
+    for page in doc:
+        rows = {}
+        for word in page.get_text("words"):
+            x0, y0, x1, y1, text = word[:5]
+            row_key = round(y0, 1)
+            rows.setdefault(row_key, []).append(word)
+
+        for row_y in sorted(rows):
+            row = sorted(rows[row_y], key=lambda w: w[0])
+            texts = [w[4].strip() for w in row if w[4].strip()]
+
+            if len(texts) < 3:
+                continue
+
+            if texts[0] not in month_map or not re.fullmatch(r"\d{1,2}", texts[1]):
+                continue
+
+            row_text = " ".join(texts)
+            if "Opening balance" in row_text or "Closing totals" in row_text:
+                continue
+
+            debit = 0.0
+            credit = 0.0
+
+            for w in row:
+                x0, y0, x1, y1, text = w[:5]
+                cleaned = text.replace("$", "").replace(",", "").strip()
+                if not re.fullmatch(r"\d+\.\d{2}", cleaned):
+                    continue
+                amount = float(cleaned)
+
+                # BMO statement columns:
+                # debit around x=350, credit around x=440, balance around x=515.
+                if 300 <= x0 < 390:
+                    debit = amount
+                elif 390 <= x0 < 485:
+                    credit = amount
+
+            if debit == 0 and credit == 0:
+                continue
+
+            description = " ".join(
+                w[4].strip()
+                for w in row
+                if 95 <= w[0] < 300
+            ).strip()
+
+            month = month_map[texts[0]]
+            day = int(texts[1])
+            year = info["statement_year"]
+
+            date_obj = datetime(year, month, day)
+
+            transactions.append({
+                "Date": date_obj.strftime("%Y-%m-%d"),
+                "Description": description or "BMO transaction",
+                "Debit": debit,
+                "Credit": credit
+            })
+
+    doc.close()
+    df = pd.DataFrame(transactions)
+
+    if not df.empty:
+        df["Debit"] = pd.to_numeric(df["Debit"], errors="coerce").fillna(0.0)
+        df["Credit"] = pd.to_numeric(df["Credit"], errors="coerce").fillna(0.0)
+
+    controls = {
+        "debit_count": int((df["Debit"] > 0).sum()) if not df.empty else 0,
+        "credit_count": int((df["Credit"] > 0).sum()) if not df.empty else 0,
+        "debit_total": info["debit_total"],
+        "credit_total": info["credit_total"]
+    }
+
+    return df, {
+        "statement_type": "chequing",
+        "bank": "BMO Bank of Montreal",
+        "control": controls,
+        "account_id": info["account_id"],
+        "ending_balance": info["closing_balance"]
+    }
+
+
+def get_bmo_credit_card_summary(full_text):
+    summary = {
+        "previous_balance": None,
+        "payments_credits": None,
+        "purchases_charges": None,
+        "interest": 0.0,
+        "fees": 0.0,
+        "new_balance": None,
+        "statement_year": datetime.now().year,
+        # Genuine BMO Mastercard QBO supplied for this account.
+        "account_id": "5581620038833910"
+    }
+
+    patterns = {
+        "previous_balance":
+            r"Previous\s+total\s+balance.*?\$([\d,]+\.\d{2})",
+        "payments_credits":
+            r"Payments\s+and\s+credits\s+\$?([\d,]+\.\d{2})",
+        "purchases_charges":
+            r"Purchases\s+and\s+other\s+charges\s+\$?([\d,]+\.\d{2})",
+        "interest":
+            r"Total\s+interest\s+charges\s+\+?\$?([\d,]+\.\d{2})",
+        "fees":
+            r"Fees\s+\$?([\d,]+\.\d{2})",
+        "new_balance":
+            r"Total\s+balance\s+\$([\d,]+\.\d{2})"
+    }
+
+    for key, pattern in patterns.items():
+        m = re.search(pattern, full_text, re.IGNORECASE)
+        if m:
+            summary[key] = clean_amount(m.group(1))
+
+    year_match = re.search(
+        r"Statement\s+date\s+[A-Za-z]+\.\s+\d{1,2},\s+(20\d{2})",
+        full_text,
+        re.IGNORECASE
+    )
+    if year_match:
+        summary["statement_year"] = int(year_match.group(1))
+
+    return summary
+
+
+def extract_bmo_credit_card_transactions(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    full_text = "\n".join(page.get_text("text") for page in doc)
+    summary = get_bmo_credit_card_summary(full_text)
+
+    month_map = {
+        "Jan.": 1, "Feb.": 2, "Mar.": 3, "Apr.": 4,
+        "May": 5, "Jun.": 6, "Jul.": 7, "Aug.": 8,
+        "Sep.": 9, "Oct.": 10, "Nov.": 11, "Dec.": 12,
+        "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
+        "Jun": 6, "Jul": 7, "Aug": 8, "Sep": 9,
+        "Oct": 10, "Nov": 11, "Dec": 12
+    }
+
+    transactions = []
+
+    for page in doc:
+        rows = {}
+        for word in page.get_text("words"):
+            row_key = round(word[1], 1)
+            rows.setdefault(row_key, []).append(word)
+
+        for row_y in sorted(rows):
+            row = sorted(rows[row_y], key=lambda w: w[0])
+            texts = [w[4].strip() for w in row if w[4].strip()]
+
+            if len(texts) < 5:
+                continue
+
+            if (
+                texts[0] not in month_map
+                or not re.fullmatch(r"\d{1,2}", texts[1])
+                or texts[2] not in month_map
+                or not re.fullmatch(r"\d{1,2}", texts[3])
+            ):
+                continue
+
+            amount = None
+            for w in row:
+                if w[0] >= 350:
+                    cleaned = w[4].replace("$", "").replace(",", "").strip()
+                    if re.fullmatch(r"-?\d+\.\d{2}", cleaned):
+                        amount = float(cleaned)
+
+            if amount is None:
+                continue
+
+            description = " ".join(
+                w[4].strip()
+                for w in row
+                if 130 <= w[0] < 350
+            ).strip()
+
+            month = month_map[texts[0]]
+            day = int(texts[1])
+            year = summary["statement_year"]
+
+            date_obj = datetime(year, month, day)
+
+            # BMO statement transaction amounts are charges unless printed negative.
+            if amount < 0:
+                debit = 0.0
+                credit = abs(amount)
+            else:
+                debit = amount
+                credit = 0.0
+
+            transactions.append({
+                "Date": date_obj.strftime("%Y-%m-%d"),
+                "Description": description or "BMO Mastercard transaction",
+                "Debit": debit,
+                "Credit": credit
+            })
+
+    doc.close()
+    df = pd.DataFrame(transactions)
+
+    if not df.empty:
+        df["Debit"] = pd.to_numeric(df["Debit"], errors="coerce").fillna(0.0)
+        df["Credit"] = pd.to_numeric(df["Credit"], errors="coerce").fillna(0.0)
+
+    return df, {
+        "statement_type": "credit_card",
+        "bank": "BMO Bank of Montreal",
+        "account_id": summary["account_id"],
+        "summary": summary
+    }
+
+
+def generate_bmo_chequing_qbo(df, account_id, ending_balance):
+    working_df = df.copy()
+    working_df["DateObject"] = pd.to_datetime(working_df["Date"])
+
+    def bmo_dt(value):
+        return value.strftime("%Y%m%d") + "000000.000[-5:EDT]"
+
+    now_text = datetime.now().strftime("%Y%m%d%H%M%S") + ".000[-5:EDT]"
+    first_date = working_df["DateObject"].min()
+    last_date = working_df["DateObject"].max()
+
+    blocks = []
+    duplicate_counter = {}
+
+    for _, row in working_df.iterrows():
+        amount = float(row["Credit"]) - float(row["Debit"])
+        date_obj = row["DateObject"]
+        desc = clean_qbo_text(row["Description"])
+        key = (date_obj.strftime("%Y%m%d"), desc, f"{amount:.2f}")
+        duplicate_counter[key] = duplicate_counter.get(key, 0) + 1
+        fitid = create_fitid(
+            "BMOCHEQ", key[0], desc, amount, duplicate_counter[key]
+        )
+        trntype = "DEBIT" if amount < 0 else "CREDIT"
+
+        blocks.append(
+            "<STMTTRN>\n"
+            f"<TRNTYPE>{trntype}\n"
+            f"<DTPOSTED>{bmo_dt(date_obj)}\n"
+            f"<TRNAMT>{amount:.2f}\n"
+            f"<FITID>{fitid}\n"
+            f"<NAME>{desc[:32]}\n"
+            f"<MEMO>{desc[:255]}\n"
+            "</STMTTRN>"
+        )
+
+    tx_text = "\n".join(blocks)
+    bal = float(ending_balance or 0.0)
+
+    return f"""OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+SECURITY:NONE
+ENCODING:USASCII
+CHARSET:1252
+COMPRESSION:NONE
+OLDFILEUID:NONE
+NEWFILEUID:NONE
+
+<OFX>
+<SIGNONMSGSRSV1>
+<SONRS>
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+<MESSAGE>OK
+</STATUS>
+<DTSERVER>{now_text}
+<LANGUAGE>ENG
+<INTU.BID>00001
+</SONRS>
+</SIGNONMSGSRSV1>
+<BANKMSGSRSV1>
+<STMTTRNRS>
+<TRNUID>1
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+<MESSAGE>OK
+</STATUS>
+<STMTRS>
+<CURDEF>CAD
+<BANKACCTFROM>
+<BANKID>200000100
+<ACCTID>{account_id}
+<ACCTTYPE>CHECKING
+</BANKACCTFROM>
+<BANKTRANLIST>
+<DTSTART>{bmo_dt(first_date)}
+<DTEND>{bmo_dt(last_date)}
+{tx_text}
+</BANKTRANLIST>
+<LEDGERBAL>
+<BALAMT>{bal:.2f}
+<DTASOF>{bmo_dt(last_date)}
+</LEDGERBAL>
+<AVAILBAL>
+<BALAMT>{bal:.2f}
+<DTASOF>{bmo_dt(last_date)}
+</AVAILBAL>
+</STMTRS>
+</STMTTRNRS>
+</BANKMSGSRSV1>
+</OFX>
+"""
+
+
+def generate_bmo_credit_card_qbo(df, account_id, new_balance):
+    working_df = df.copy()
+    working_df["DateObject"] = pd.to_datetime(working_df["Date"])
+
+    def bmo_dt(value):
+        return value.strftime("%Y%m%d") + "000000.000[-5:EDT]"
+
+    now_text = datetime.now().strftime("%Y%m%d%H%M%S") + ".000[-5:EDT]"
+    first_date = working_df["DateObject"].min()
+    last_date = working_df["DateObject"].max()
+
+    blocks = []
+    duplicate_counter = {}
+
+    for _, row in working_df.iterrows():
+        amount = float(row["Credit"]) - float(row["Debit"])
+        date_obj = row["DateObject"]
+        desc = clean_qbo_text(row["Description"])
+        key = (date_obj.strftime("%Y%m%d"), desc, f"{amount:.2f}")
+        duplicate_counter[key] = duplicate_counter.get(key, 0) + 1
+        fitid = create_fitid(
+            "BMOCC", key[0], desc, amount, duplicate_counter[key]
+        )
+        trntype = "DEBIT" if amount < 0 else "CREDIT"
+
+        blocks.append(
+            "<STMTTRN>\n"
+            f"<TRNTYPE>{trntype}\n"
+            f"<DTPOSTED>{bmo_dt(date_obj)}\n"
+            f"<TRNAMT>{amount:.2f}\n"
+            f"<FITID>{fitid}\n"
+            f"<NAME>{desc[:32]}\n"
+            "</STMTTRN>"
+        )
+
+    tx_text = "\n".join(blocks)
+
+    # Genuine BMO credit-card QBO reports liability balance as negative.
+    bal = -float(new_balance or 0.0)
+
+    return f"""OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+SECURITY:NONE
+ENCODING:USASCII
+CHARSET:1252
+COMPRESSION:NONE
+OLDFILEUID:NONE
+NEWFILEUID:NONE
+<OFX>
+<SIGNONMSGSRSV1>
+<SONRS>
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+<MESSAGE>OK
+</STATUS>
+<DTSERVER>{now_text}
+<LANGUAGE>ENG
+<INTU.BID>00017
+</SONRS>
+</SIGNONMSGSRSV1>
+<CREDITCARDMSGSRSV1>
+<CCSTMTTRNRS>
+<TRNUID>1
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+<MESSAGE>OK
+</STATUS>
+<CCSTMTRS>
+<CURDEF>CAD
+<CCACCTFROM>
+<ACCTID>{account_id}
+</CCACCTFROM>
+<BANKTRANLIST>
+<DTSTART>{bmo_dt(first_date)}
+<DTEND>{bmo_dt(last_date)}
+{tx_text}
+</BANKTRANLIST>
+<LEDGERBAL>
+<BALAMT>{bal:.2f}
+<DTASOF>{now_text}
+</LEDGERBAL>
+<AVAILBAL>
+<BALAMT>{bal:.2f}
+<DTASOF>{now_text}
+</AVAILBAL>
+</CCSTMTRS>
+</CCSTMTTRNRS>
+</CREDITCARDMSGSRSV1>
+</OFX>
+"""
+
+
 # =========================================================
 # CREDIT CARD SUMMARY
 # =========================================================
@@ -1945,7 +2415,9 @@ SUPPORTED_COMBINATIONS = {
     ("TD Canada Trust", "Business Chequing"),
     ("TD Canada Trust", "Credit Card"),
     ("RBC Royal Bank", "Business Chequing"),
-    ("RBC Royal Bank", "Credit Card")
+    ("RBC Royal Bank", "Credit Card"),
+    ("BMO Bank of Montreal", "Business Chequing"),
+    ("BMO Bank of Montreal", "Credit Card")
 }
 
 
@@ -2032,6 +2504,30 @@ if uploaded_file is not None:
 
                 df, statement_info = (
                     extract_td_chequing_transactions(
+                        pdf_bytes
+                    )
+                )
+
+            elif (
+                bank == "BMO Bank of Montreal"
+                and
+                account_type == "Credit Card"
+            ):
+
+                df, statement_info = (
+                    extract_bmo_credit_card_transactions(
+                        pdf_bytes
+                    )
+                )
+
+            elif (
+                bank == "BMO Bank of Montreal"
+                and
+                account_type == "Business Chequing"
+            ):
+
+                df, statement_info = (
+                    extract_bmo_business_chequing_transactions(
                         pdf_bytes
                     )
                 )
@@ -2583,6 +3079,16 @@ if "transactions" in st.session_state:
                         )
                     )
 
+                elif statement_info.get("bank") == "BMO Bank of Montreal":
+
+                    qbo_data = (
+                        generate_bmo_chequing_qbo(
+                            edited_df,
+                            statement_info["account_id"],
+                            statement_info.get("ending_balance")
+                        )
+                    )
+
                 else:
 
                     qbo_data = (
@@ -2597,6 +3103,25 @@ if "transactions" in st.session_state:
             else:
 
                 if (
+                    statement_info.get("bank")
+                    == "BMO Bank of Montreal"
+                ):
+
+                    qbo_data = (
+                        generate_bmo_credit_card_qbo(
+                            edited_df,
+                            statement_info[
+                                "account_id"
+                            ],
+                            statement_info[
+                                "summary"
+                            ].get(
+                                "new_balance"
+                            )
+                        )
+                    )
+
+                elif (
                     statement_info.get("bank")
                     == "RBC Royal Bank"
                 ):
