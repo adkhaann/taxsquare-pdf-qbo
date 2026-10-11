@@ -2638,6 +2638,157 @@ NEWFILEUID:NONE
 # USER INTERFACE
 # =========================================================
 
+
+# =========================================================
+# CIBC CREDIT CARD AND CHEQUING (CSV VERIFIED; QBO PENDING)
+# =========================================================
+
+def cibc_money(raw):
+    value = clean_amount(raw.replace('CR', '').replace(' ', ''))
+    return -value if 'CR' in raw.upper() else value
+
+
+def cibc_date(month_day, statement_year, statement_month):
+    date = datetime.strptime(f"{month_day} {statement_year}", "%b %d %Y")
+    if date.month > statement_month:
+        date = datetime.strptime(f"{month_day} {statement_year-1}", "%b %d %Y")
+    return date.strftime('%Y-%m-%d')
+
+
+def extract_cibc_credit_card_transactions(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+    text = doc[0].get_text('text')
+    if 'Your account at a glance' not in text or 'Visa' not in text:
+        raise ValueError('This PDF does not appear to be a supported CIBC Visa statement.')
+    m = re.search(r'Statement Date\s+([A-Za-z]+)\s+(\d{1,2}),\s+(20\d{2})', text)
+    if not m:
+        raise ValueError('CIBC credit card statement date was not found.')
+    year = int(m.group(3)); month = datetime.strptime(m.group(1), '%B').month
+    def amount_after(label):
+        found = re.search(r'(?m)^'+re.escape(label)+r'\s*\n(?:[+\-=]\s*\n)?\s*(\$?[\d,]+\.\d{2}\s*(?:CR)?)', text, re.I)
+        if not found:
+            raise ValueError(f'CIBC statement summary field missing: {label}')
+        return cibc_money(found.group(1))
+    summary = {
+        'previous_balance': amount_after('Previous balance'),
+        'payments_credits': amount_after('Total credits'),
+        'purchases_charges': amount_after('Total charges'),
+        'interest': 0.0,
+        'fees': 0.0,
+        'new_balance': amount_after('Total balance'),
+    }
+    # Total charges includes cash advances, interest and fees. Keep those
+    # separately at zero so that charges are not counted twice.
+    if len(doc) < 2:
+        raise ValueError('CIBC credit card transaction page missing.')
+    lines = [x.strip() for x in doc[1].get_text('text').splitlines()]
+    transactions = []
+    section = None
+    for i, line in enumerate(lines):
+        if line == 'Your payments': section = 'payments'
+        elif line == 'Your new charges and credits': section = 'charges'
+        if line.startswith('Total payments') or line.startswith('Total for '):
+            section = None
+        if not re.fullmatch(r'[A-Z][a-z]{2}\s+\d{1,2}', line):
+            continue
+        if section not in ('payments', 'charges') or i+3 >= len(lines):
+            continue
+        # Transaction date, posting date, description, [category], amount.
+        if not re.match(r'^[A-Z][a-z]{2}\s+\d{1,2}', lines[i+1]):
+            continue
+        desc = re.sub(r'^[A-Z][a-z]{2}\s+\d{1,2}\s*', '', lines[i+1]).lstrip('Ý ').strip() or lines[i+2].lstrip('Ý ').strip()
+        candidate = lines[i+2:i+6]
+        amount = next((clean_amount(x) for x in candidate if re.fullmatch(r'\$?[\d,]+\.\d{2}(?:CR)?', x)), None)
+        if amount is None: continue
+        transactions.append({
+            'Date': cibc_date(line, year, month),
+            'Description': desc,
+            'Debit': amount if section == 'charges' else 0.0,
+            'Credit': amount if section == 'payments' else 0.0,
+        })
+    doc.close()
+    return pd.DataFrame(transactions, columns=['Date','Description','Debit','Credit']), {
+        'statement_type':'credit_card', 'bank':'CIBC', 'summary':summary,
+        'account_id':None, 'qbo_verified':False
+    }
+
+
+def extract_cibc_chequing_transactions(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+    first = doc[0].get_text('text')
+    if 'CIBC Account Statement' not in first or 'Transaction details' not in first:
+        raise ValueError('This is not the supported CIBC chequing statement layout.')
+    m = re.search(r'For\s+([A-Za-z]+)\s+\d+\s+to\s+([A-Za-z]+)\s+\d+,\s+(20\d{2})', first)
+    if not m: raise ValueError('Could not read CIBC chequing statement period.')
+    year=int(m.group(3)); month=datetime.strptime(m.group(2),'%b').month
+    def control(label):
+        m=re.search(r'(?m)^'+re.escape(label)+r'[^\n]*\n(?:[=+\-]\s*\n)?\$?([\d,]+\.\d{2})',first)
+        if not m: raise ValueError(f'CIBC control missing: {label}')
+        return clean_amount(m.group(1))
+    opening=control('Opening balance on') if False else None
+    opening_match=re.search(r'Opening balance on[^\n]*\n\$?([\d,]+\.\d{2})',first)
+    closing_match=re.search(r'Closing balance on[^\n]*\n(?:=\s*\n)?\$?([\d,]+\.\d{2})',first)
+    if not opening_match or not closing_match: raise ValueError('CIBC opening or closing balance missing.')
+    opening=clean_amount(opening_match.group(1)); closing=clean_amount(closing_match.group(1))
+    debit_control=control('Withdrawals'); credit_control=control('Deposits')
+    transactions=[]; last_date=None; previous_balance=opening
+    for page in doc:
+        lines=[x.strip() for x in page.get_text('text').splitlines()]
+        start=next((i for i,x in enumerate(lines) if x.startswith('Transaction details')),None)
+        if start is None: continue
+        end=next((i for i in range(start+1,len(lines)) if lines[i].startswith('Important:') or lines[i].startswith('(continued on next page)')),len(lines))
+        segment=lines[start:end]
+        i=0
+        while i < len(segment):
+            line=segment[i]
+            d=re.fullmatch(r'([A-Z][a-z]{2})\s+(\d{1,2})',line)
+            if d:
+                last_date=cibc_date(line,year,month)
+                i+=1; continue
+            if line.lower() in ('opening balance','balance forward','closing balance'):
+                i+=1
+                if i < len(segment) and re.fullmatch(r'\$?[\d,]+\.\d{2}',segment[i]): i+=1
+                continue
+            if not last_date or line in ('Date','Description','Withdrawals ($)','Deposits ($)','Balance ($)'):
+                i+=1;continue
+            # Description may span lines. The final two money values are
+            # transaction amount and resulting running balance.
+            j=i; descriptions=[]; money=[]
+            while j<len(segment):
+                t=segment[j]
+                if re.fullmatch(r'[A-Z][a-z]{2}\s+\d{1,2}',t) or t.lower() in ('closing balance','balance forward'):
+                    break
+                if re.fullmatch(r'\$?[\d,]+\.\d{2}',t):
+                    money.append(clean_amount(t))
+                    if len(money)==2:
+                        j+=1;break
+                else:
+                    descriptions.append(t)
+                j+=1
+            if len(money)==2 and descriptions:
+                amount, running=money
+                delta=round(running-previous_balance,2)
+                if abs(abs(delta)-amount)<0.011:
+                    transactions.append({'Date':last_date,'Description':' '.join(descriptions),
+                                         'Debit':amount if delta<0 else 0.0,
+                                         'Credit':amount if delta>0 else 0.0})
+                    previous_balance=running
+                else:
+                    raise ValueError(f'CIBC running balance mismatch near {descriptions[0]}: {previous_balance} to {running}, amount {amount}')
+                i=j
+            else:
+                i+=1
+    doc.close()
+    df=pd.DataFrame(transactions,columns=['Date','Description','Debit','Credit'])
+    if abs(previous_balance-closing)>0.011:
+        raise ValueError(f'CIBC final balance mismatch: {previous_balance} vs {closing}')
+    return df, {
+        'statement_type':'chequing','bank':'CIBC',
+        'control':{'debit_count':int((df.Debit>0).sum()),'debit_total':debit_control,
+                   'credit_count':int((df.Credit>0).sum()),'credit_total':credit_control},
+        'account_id':None,'ending_balance':closing,'qbo_verified':False
+    }
+
 # =========================================================
 # BANK / ACCOUNT SELECTION
 #
@@ -2690,7 +2841,10 @@ SUPPORTED_COMBINATIONS = {
     ("RBC Royal Bank", "Credit Card"),
     ("BMO Bank of Montreal", "Business Chequing"),
     ("BMO Bank of Montreal", "Credit Card"),
-    ("Scotiabank", "Business Chequing")
+    ("Scotiabank", "Business Chequing"),
+    ("CIBC", "Personal Chequing"),
+    ("CIBC", "Business Chequing"),
+    ("CIBC", "Credit Card")
 }
 
 
@@ -2757,7 +2911,13 @@ if uploaded_file is not None:
 
         try:
 
-            if (
+            if bank == "CIBC" and account_type == "Credit Card":
+                df, statement_info = extract_cibc_credit_card_transactions(pdf_bytes)
+
+            elif bank == "CIBC" and account_type in ("Personal Chequing", "Business Chequing"):
+                df, statement_info = extract_cibc_chequing_transactions(pdf_bytes)
+
+            elif (
                 bank == "TD Canada Trust"
                 and
                 account_type == "Credit Card"
@@ -3346,7 +3506,11 @@ if "transactions" in st.session_state:
                 )
             )
 
-            if (
+            qbo_data = None
+            if statement_info.get("bank") == "CIBC":
+                st.info("CIBC QBO export is pending verification of genuine CIBC Web Connect identifiers. CSV is available.")
+
+            elif (
                 statement_info[
                     "statement_type"
                 ]
@@ -3471,20 +3635,16 @@ if "transactions" in st.session_state:
 
             with col2:
 
-                st.download_button(
-                    label=(
-                        "Download QuickBooks QBO"
-                    ),
-                    data=qbo_data.encode(
-                        "cp1252",
-                        errors="replace"
-                    ),
-                    file_name=(
-                        "quickbooks_webconnect.qbo"
-                    ),
-                    mime="application/x-ofx",
-                    use_container_width=True
-                )
+                if qbo_data is not None:
+                    st.download_button(
+                        label="Download QuickBooks QBO",
+                        data=qbo_data.encode("cp1252", errors="replace"),
+                        file_name="quickbooks_webconnect.qbo",
+                        mime="application/x-ofx",
+                        use_container_width=True
+                    )
+                else:
+                    st.button("Download QuickBooks QBO (CIBC pending)", disabled=True, use_container_width=True)
 
         else:
 
