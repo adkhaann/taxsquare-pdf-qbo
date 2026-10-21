@@ -2816,7 +2816,7 @@ def generate_cibc_qbo(df, info, account_type):
         tx.append(f'<STMTTRN><TRNTYPE>{typ}<DTPOSTED>{date}120000.000[-5:EST]<TRNAMT>{amount:.2f}<FITID>{fitid}<NAME>{name[:32]}<MEMO>{name[:255]}</STMTTRN>')
     return ('OFXHEADER:100\nDATA:OFXSGML\nVERSION:102\nSECURITY:NONE\nENCODING:USASCII\nCHARSET:1252\nCOMPRESSION:NONE\nOLDFILEUID:NONE\nNEWFILEUID:NONE\n\n'
             f'<OFX><SIGNONMSGSRSV1><SONRS><STATUS><CODE>0<SEVERITY>INFO<MESSAGE>OK</STATUS><DTSERVER>{now}<LANGUAGE>ENG<INTU.BID>00005</SONRS></SIGNONMSGSRSV1>'
-            f'<{outer}><{response}><TRNUID>{now}<STATUS><CODE>0<SEVERITY>INFO<MESSAGE>OK</STATUS><{statement}><CURDEF>CAD>{acct_tag}'
+            f'<{outer}><{response}><TRNUID>{now}<STATUS><CODE>0<SEVERITY>INFO<MESSAGE>OK</STATUS><{statement}><CURDEF>CAD{acct_tag}'
             f'<BANKTRANLIST><DTSTART>{start}<DTEND>{end}'+''.join(tx)+'</BANKTRANLIST>'
             f'<LEDGERBAL><BALAMT>{ending:.2f}<DTASOF>{now}</LEDGERBAL></{statement}></{response}></{outer}></OFX>')
 
