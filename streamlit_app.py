@@ -2655,139 +2655,170 @@ def cibc_date(month_day, statement_year, statement_month):
     return date.strftime('%Y-%m-%d')
 
 
+def cibc_signed(raw):
+    raw = str(raw).strip()
+    negative = raw.startswith('-') or raw.upper().endswith('CR')
+    value = clean_amount(raw.replace('-', '').replace('CR', '').replace('$', ''))
+    return -value if negative else value
+
+
+def cibc_bank_identifier(full_text):
+    transit = re.search(r'Branch transit number\s+(\d{5})', full_text)
+    acct = re.search(r'Account number\s+(\d{2}-\d{5})', full_text)
+    if not transit or not acct:
+        raise ValueError('CIBC transit/account identifiers not found in PDF.')
+    return transit.group(1) + ' ' + acct.group(1)
+
+
 def extract_cibc_credit_card_transactions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype='pdf')
     text = doc[0].get_text('text')
     if 'Your account at a glance' not in text or 'Visa' not in text:
-        raise ValueError('This PDF does not appear to be a supported CIBC Visa statement.')
-    m = re.search(r'Statement Date\s+([A-Za-z]+)\s+(\d{1,2}),\s+(20\d{2})', text)
-    if not m:
-        raise ValueError('CIBC credit card statement date was not found.')
-    year = int(m.group(3)); month = datetime.strptime(m.group(1), '%B').month
-    def amount_after(label):
-        found = re.search(r'(?m)^'+re.escape(label)+r'\s*\n(?:[+\-=]\s*\n)?\s*(\$?[\d,]+\.\d{2}\s*(?:CR)?)', text, re.I)
-        if not found:
-            raise ValueError(f'CIBC statement summary field missing: {label}')
-        return cibc_money(found.group(1))
-    summary = {
-        'previous_balance': amount_after('Previous balance'),
-        'payments_credits': amount_after('Total credits'),
-        'purchases_charges': amount_after('Total charges'),
-        'interest': 0.0,
-        'fees': 0.0,
-        'new_balance': amount_after('Total balance'),
-    }
-    # Total charges includes cash advances, interest and fees. Keep those
-    # separately at zero so that charges are not counted twice.
-    if len(doc) < 2:
-        raise ValueError('CIBC credit card transaction page missing.')
-    lines = [x.strip() for x in doc[1].get_text('text').splitlines()]
-    transactions = []
-    section = None
-    for i, line in enumerate(lines):
-        if line == 'Your payments': section = 'payments'
-        elif line == 'Your new charges and credits': section = 'charges'
-        if line.startswith('Total payments') or line.startswith('Total for '):
-            section = None
-        if not re.fullmatch(r'[A-Z][a-z]{2}\s+\d{1,2}', line):
+        raise ValueError('Not a supported CIBC Visa statement.')
+    date_match = re.search(r'Statement Date\s+([A-Za-z]+)\s+(\d{1,2}),\s+(20\d{2})', text)
+    card_match = re.search(r'Account number\s+(\d{4})\s+XXXX\s+XXXX\s+(\d{4})', text)
+    if not date_match or not card_match:
+        raise ValueError('CIBC statement date or card number missing.')
+    year = int(date_match.group(3)); month = datetime.strptime(date_match.group(1), '%B').month
+    def summary_amount(label):
+        match = re.search(r'(?m)^'+re.escape(label)+r'\s*\n(?:[+\-=]\s*\n)?\s*([-]?[\$]?[\d,]+\.\d{2}\s*(?:CR)?)', text, re.I)
+        if not match: raise ValueError('CIBC credit-card summary missing: '+label)
+        return cibc_signed(match.group(1))
+    total_charges = summary_amount('Total charges')
+    total_credits = summary_amount('Total credits')
+    summary = {'previous_balance':summary_amount('Previous balance'),
+               'payments_credits':abs(total_credits), 'purchases_charges':total_charges,
+               'interest':0.0, 'fees':0.0, 'new_balance':summary_amount('Total balance')}
+    if len(doc)<2: raise ValueError('CIBC credit-card transaction page missing.')
+    lines=[v.strip() for v in doc[1].get_text('text').splitlines()]
+    section=None; tx=[]
+    date_re=re.compile(r'^[A-Z][a-z]{2}\s+\d{1,2}$')
+    money_re=re.compile(r'^-?\$?[\d,]+\.\d{2}$')
+    for i,line in enumerate(lines):
+        if line=='Your payments': section='payments'
+        elif line=='Your interest': section='interest'
+        elif line=='Your new charges and credits': section='charges'
+        elif line.startswith(('Total payments','Total interest this period','Total for ')):
+            section=None
+        if section not in ('payments','interest','charges') or not date_re.fullmatch(line):
             continue
-        if section not in ('payments', 'charges') or i+3 >= len(lines):
-            continue
-        # Transaction date, posting date, description, [category], amount.
-        if not re.match(r'^[A-Z][a-z]{2}\s+\d{1,2}', lines[i+1]):
-            continue
-        desc = re.sub(r'^[A-Z][a-z]{2}\s+\d{1,2}\s*', '', lines[i+1]).lstrip('Ý ').strip() or lines[i+2].lstrip('Ý ').strip()
-        candidate = lines[i+2:i+6]
-        amount = next((clean_amount(x) for x in candidate if re.fullmatch(r'\$?[\d,]+\.\d{2}(?:CR)?', x)), None)
-        if amount is None: continue
-        transactions.append({
-            'Date': cibc_date(line, year, month),
-            'Description': desc,
-            'Debit': amount if section == 'charges' else 0.0,
-            'Credit': amount if section == 'payments' else 0.0,
-        })
+        if i+3>=len(lines) or not re.match(r'^[A-Z][a-z]{2}\s+\d{1,2}\b', lines[i+1]):continue
+        posted=lines[i+1]
+        desc=re.sub(r'^[A-Z][a-z]{2}\s+\d{1,2}\s*','',posted).strip().lstrip('QÝ ').strip()
+        if not desc:desc=lines[i+2].lstrip('QÝ ').strip()
+        amounts=[(j, cibc_signed(lines[j])) for j in range(i+2,min(i+8,len(lines))) if money_re.fullmatch(lines[j])]
+        if not amounts:continue
+        amount=amounts[0][1]
+        if section=='interest' and abs(amount)<0.001:continue
+        debit=abs(amount) if section=='interest' or (section=='charges' and amount>0) else 0.0
+        credit=abs(amount) if section=='payments' or (section=='charges' and amount<0) else 0.0
+        tx.append({'Date':cibc_date(line,year,month),'Description':desc,
+                   'Debit':round(debit,2),'Credit':round(credit,2)})
     doc.close()
-    return pd.DataFrame(transactions, columns=['Date','Description','Debit','Credit']), {
-        'statement_type':'credit_card', 'bank':'CIBC', 'summary':summary,
-        'account_id':None, 'qbo_verified':False
-    }
+    df=pd.DataFrame(tx,columns=['Date','Description','Debit','Credit'])
+    if abs(df.Debit.sum()-total_charges)>0.011 or abs(df.Credit.sum()-total_credits)>0.011:
+        raise ValueError(f'CIBC CC transaction totals mismatch: debits {df.Debit.sum():.2f} vs {total_charges:.2f}; credits {df.Credit.sum():.2f} vs {total_credits:.2f}.')
+    return df,{'statement_type':'credit_card','bank':'CIBC','summary':summary,
+               'account_id':None,'cibc_card_suffix':card_match.group(2), 'qbo_verified':True}
 
 
 def extract_cibc_chequing_transactions(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype='pdf')
-    first = doc[0].get_text('text')
+    doc=fitz.open(stream=pdf_bytes,filetype='pdf')
+    first=doc[0].get_text('text')
     if 'CIBC Account Statement' not in first or 'Transaction details' not in first:
-        raise ValueError('This is not the supported CIBC chequing statement layout.')
-    m = re.search(r'For\s+([A-Za-z]+)\s+\d+\s+to\s+([A-Za-z]+)\s+\d+,\s+(20\d{2})', first)
-    if not m: raise ValueError('Could not read CIBC chequing statement period.')
-    year=int(m.group(3)); month=datetime.strptime(m.group(2),'%b').month
-    def control(label):
-        m=re.search(r'(?m)^'+re.escape(label)+r'[^\n]*\n(?:[=+\-]\s*\n)?\$?([\d,]+\.\d{2})',first)
-        if not m: raise ValueError(f'CIBC control missing: {label}')
-        return clean_amount(m.group(1))
-    opening=control('Opening balance on') if False else None
-    opening_match=re.search(r'Opening balance on[^\n]*\n\$?([\d,]+\.\d{2})',first)
-    closing_match=re.search(r'Closing balance on[^\n]*\n(?:=\s*\n)?\$?([\d,]+\.\d{2})',first)
-    if not opening_match or not closing_match: raise ValueError('CIBC opening or closing balance missing.')
-    opening=clean_amount(opening_match.group(1)); closing=clean_amount(closing_match.group(1))
-    debit_control=control('Withdrawals'); credit_control=control('Deposits')
-    transactions=[]; last_date=None; previous_balance=opening
+        raise ValueError('Not a supported CIBC bank account statement.')
+    m=re.search(r'For\s+([A-Za-z]+)\s+\d+\s+to\s+([A-Za-z]+)\s+\d+,\s+(20\d{2})',first)
+    if not m:raise ValueError('CIBC statement period missing.')
+    year=int(m.group(3));month=datetime.strptime(m.group(2),'%b').month
+    def ctl(label):
+        x=re.search(r'(?m)^'+re.escape(label)+r'[^\n]*\n(?:[+\-=]\s*\n)?\s*(-?\$?[\d,]+\.\d{2})',first)
+        if not x:raise ValueError('CIBC summary missing: '+label)
+        return cibc_signed(x.group(1))
+    opening=ctl('Opening balance on');closing=ctl('Closing balance on')
+    debit_total=ctl('Withdrawals');credit_total=ctl('Deposits')
+    acct=cibc_bank_identifier(first)
+    transactions=[];previous=opening;date=None
+    money_re=re.compile(r'^-?\$?[\d,]+\.\d{2}$')
+    date_re=re.compile(r'^[A-Z][a-z]{2}\s+\d{1,2}$')
     for page in doc:
         lines=[x.strip() for x in page.get_text('text').splitlines()]
         start=next((i for i,x in enumerate(lines) if x.startswith('Transaction details')),None)
-        if start is None: continue
-        end=next((i for i in range(start+1,len(lines)) if lines[i].startswith('Important:') or lines[i].startswith('(continued on next page)')),len(lines))
-        segment=lines[start:end]
-        i=0
-        while i < len(segment):
-            line=segment[i]
-            d=re.fullmatch(r'([A-Z][a-z]{2})\s+(\d{1,2})',line)
-            if d:
-                last_date=cibc_date(line,year,month)
-                i+=1; continue
+        if start is None:continue
+        end=next((i for i in range(start+1,len(lines)) if lines[i].startswith(('Important:','(continued on next page)'))),len(lines))
+        seg=lines[start:end];i=0
+        while i<len(seg):
+            line=seg[i]
+            if date_re.fullmatch(line):
+                date=cibc_date(line,year,month);i+=1;continue
             if line.lower() in ('opening balance','balance forward','closing balance'):
                 i+=1
-                if i < len(segment) and re.fullmatch(r'\$?[\d,]+\.\d{2}',segment[i]): i+=1
+                if i<len(seg) and money_re.fullmatch(seg[i]):i+=1
                 continue
-            if not last_date or line in ('Date','Description','Withdrawals ($)','Deposits ($)','Balance ($)'):
+            if not date or line in ('Date','Description','Withdrawals ($)','Deposits ($)','Balance ($)'):
                 i+=1;continue
-            # Description may span lines. The final two money values are
-            # transaction amount and resulting running balance.
-            j=i; descriptions=[]; money=[]
-            while j<len(segment):
-                t=segment[j]
-                if re.fullmatch(r'[A-Z][a-z]{2}\s+\d{1,2}',t) or t.lower() in ('closing balance','balance forward'):
-                    break
-                if re.fullmatch(r'\$?[\d,]+\.\d{2}',t):
-                    money.append(clean_amount(t))
-                    if len(money)==2:
-                        j+=1;break
-                else:
-                    descriptions.append(t)
+            j=i;desc=[];amounts=[]
+            while j<len(seg):
+                t=seg[j]
+                if date_re.fullmatch(t) or t.lower() in ('closing balance','balance forward'):break
+                if money_re.fullmatch(t):
+                    amounts.append(cibc_signed(t))
+                    if len(amounts)==2:j+=1;break
+                else:desc.append(t)
                 j+=1
-            if len(money)==2 and descriptions:
-                amount, running=money
-                delta=round(running-previous_balance,2)
-                if abs(abs(delta)-amount)<0.011:
-                    transactions.append({'Date':last_date,'Description':' '.join(descriptions),
-                                         'Debit':amount if delta<0 else 0.0,
-                                         'Credit':amount if delta>0 else 0.0})
-                    previous_balance=running
-                else:
-                    raise ValueError(f'CIBC running balance mismatch near {descriptions[0]}: {previous_balance} to {running}, amount {amount}')
-                i=j
-            else:
-                i+=1
+            if len(amounts)==2 and desc:
+                amount,running=amounts;amount=abs(amount)
+                delta=round(running-previous,2)
+                if abs(abs(delta)-amount)>0.011:
+                    raise ValueError(f'CIBC running balance mismatch near {desc[0]}: {previous:.2f} to {running:.2f}, transaction {amount:.2f}')
+                transactions.append({'Date':date,'Description':' '.join(desc),
+                                     'Debit':amount if delta<0 else 0.0,'Credit':amount if delta>0 else 0.0})
+                previous=running;i=j
+            else:i+=1
     doc.close()
     df=pd.DataFrame(transactions,columns=['Date','Description','Debit','Credit'])
-    if abs(previous_balance-closing)>0.011:
-        raise ValueError(f'CIBC final balance mismatch: {previous_balance} vs {closing}')
-    return df, {
-        'statement_type':'chequing','bank':'CIBC',
-        'control':{'debit_count':int((df.Debit>0).sum()),'debit_total':debit_control,
-                   'credit_count':int((df.Credit>0).sum()),'credit_total':credit_control},
-        'account_id':None,'ending_balance':closing,'qbo_verified':False
-    }
+    if abs(previous-closing)>0.011 or abs(df.Debit.sum()-debit_total)>0.011 or abs(df.Credit.sum()-credit_total)>0.011:
+        raise ValueError(f'CIBC chequing/savings control mismatch: ending {previous:.2f}/{closing:.2f}; debits {df.Debit.sum():.2f}/{debit_total:.2f}; credits {df.Credit.sum():.2f}/{credit_total:.2f}')
+    return df,{'statement_type':'chequing','bank':'CIBC',
+               'control':{'debit_count':int((df.Debit>0).sum()),'debit_total':debit_total,
+                          'credit_count':int((df.Credit>0).sum()),'credit_total':credit_total},
+               'account_id':acct,'ending_balance':closing,'qbo_verified':True}
+
+
+def generate_cibc_qbo(df, info, account_type):
+    # Institution, account types and identifiers verified against genuine CIBC QBO exports.
+    import hashlib
+    is_card=(account_type=='Credit Card')
+    if is_card:
+        acct='4500033747910717' if info.get('cibc_card_suffix')=='0717' else None
+        if not acct:raise ValueError('This CIBC card has no verified QBO account identifier. CSV only.')
+        acct_tag=f'<CCACCTFROM><ACCTID>{acct}<ACCTTYPE>CREDITLINE</CCACCTFROM>'
+        outer='CREDITCARDMSGSRSV1';response='CCSTMTTRNRS';statement='CCSTMTRS'
+        ending=-(info['summary']['new_balance'])
+    else:
+        acct=info['account_id']
+        verified={'04322 81-39938':'CHECKING','00502 63-86091':'SAVINGS'}
+        if acct not in verified:raise ValueError('CIBC account ID not verified against genuine QBO. CSV only.')
+        acct_tag=f'<BANKACCTFROM><BANKID>600000100<ACCTID>{acct}<ACCTTYPE>{verified[acct]}</BANKACCTFROM>'
+        outer='BANKMSGSRSV1';response='STMTTRNRS';statement='STMTRS'
+        ending=info['ending_balance']
+    dates=pd.to_datetime(df.Date)
+    start=dates.min().strftime('%Y%m%d')+'120000';end=dates.max().strftime('%Y%m%d')+'120000'
+    now=datetime.now().strftime('%Y%m%d%H%M%S')
+    tx=[];seen={}
+    for _,r in df.iterrows():
+        date=pd.to_datetime(r['Date']).strftime('%Y%m%d')
+        amount=round(float(r['Credit'])-float(r['Debit']),2)
+        name=clean_qbo_text(str(r['Description']))
+        key=f'{acct}|{date}|{amount:.2f}|{name}'
+        seen[key]=seen.get(key,0)+1
+        fitid=hashlib.sha256(f'{key}|{seen[key]}'.encode()).hexdigest()[:28].upper()
+        typ='DEBIT' if amount<0 else 'CREDIT'
+        tx.append(f'<STMTTRN><TRNTYPE>{typ}<DTPOSTED>{date}120000.000[-5:EST]<TRNAMT>{amount:.2f}<FITID>{fitid}<NAME>{name[:32]}<MEMO>{name[:255]}</STMTTRN>')
+    return ('OFXHEADER:100\nDATA:OFXSGML\nVERSION:102\nSECURITY:NONE\nENCODING:USASCII\nCHARSET:1252\nCOMPRESSION:NONE\nOLDFILEUID:NONE\nNEWFILEUID:NONE\n\n'
+            f'<OFX><SIGNONMSGSRSV1><SONRS><STATUS><CODE>0<SEVERITY>INFO<MESSAGE>OK</STATUS><DTSERVER>{now}<LANGUAGE>ENG<INTU.BID>00005</SONRS></SIGNONMSGSRSV1>'
+            f'<{outer}><{response}><TRNUID>{now}<STATUS><CODE>0<SEVERITY>INFO<MESSAGE>OK</STATUS><{statement}><CURDEF>CAD>{acct_tag}'
+            f'<BANKTRANLIST><DTSTART>{start}<DTEND>{end}'+''.join(tx)+'</BANKTRANLIST>'
+            f'<LEDGERBAL><BALAMT>{ending:.2f}<DTASOF>{now}</LEDGERBAL></{statement}></{response}></{outer}></OFX>')
 
 # =========================================================
 # BANK / ACCOUNT SELECTION
@@ -2844,7 +2875,9 @@ SUPPORTED_COMBINATIONS = {
     ("Scotiabank", "Business Chequing"),
     ("CIBC", "Personal Chequing"),
     ("CIBC", "Business Chequing"),
-    ("CIBC", "Credit Card")
+    ("CIBC", "Credit Card"),
+    ("CIBC", "Personal Savings"),
+    ("CIBC", "Business Savings")
 }
 
 
@@ -2914,7 +2947,7 @@ if uploaded_file is not None:
             if bank == "CIBC" and account_type == "Credit Card":
                 df, statement_info = extract_cibc_credit_card_transactions(pdf_bytes)
 
-            elif bank == "CIBC" and account_type in ("Personal Chequing", "Business Chequing"):
+            elif bank == "CIBC" and account_type in ("Personal Chequing", "Business Chequing", "Personal Savings", "Business Savings"):
                 df, statement_info = extract_cibc_chequing_transactions(pdf_bytes)
 
             elif (
@@ -3508,7 +3541,10 @@ if "transactions" in st.session_state:
 
             qbo_data = None
             if statement_info.get("bank") == "CIBC":
-                st.info("CIBC QBO export is pending verification of genuine CIBC Web Connect identifiers. CSV is available.")
+                try:
+                    qbo_data = generate_cibc_qbo(edited_df, statement_info, st.session_state.get("processed_account_type"))
+                except ValueError as cibc_error:
+                    st.info(str(cibc_error))
 
             elif (
                 statement_info[
